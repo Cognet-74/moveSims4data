@@ -473,7 +473,11 @@ function Get-TotalFileCount {
         $dir = $directories[$i]
         $i++
         
-        if ($null -eq $dir -or -not (Test-Path $dir)) {
+        if ([string]::IsNullOrEmpty($dir)) {
+            Write-Log "Warning: 'dir' is null or empty. Skipping iteration."
+            continue
+        }
+        if (-not (Test-Path -Path $dir)) {
             continue
         }
         
