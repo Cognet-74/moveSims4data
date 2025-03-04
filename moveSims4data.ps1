@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Transfers Sims 4 user data from an old installation to a new installation safely.
+    Transfers Sims 4 user data from an old installation to a new installation safely with optimized memory usage.
 
 .DESCRIPTION
     This script copies user-generated Sims 4 data (like saves, mods, tray files, screenshots, and optionally Options.ini)
@@ -8,16 +8,20 @@
     to a destination directory (on your new computer). It avoids transferring system-specific files that could
     mess up your new installation (like Config.log, GameVersion.txt, cache files, or files in ConfigOverride).
     
+    The script has been optimized to handle large file transfers (18,000+ files) with minimal memory usage.
+    
     The script works by:
-      - Skipping files that match default or user-specified blacklist patterns.
-      - Comparing file metadata (size and last modification time) and computing file hashes (SHA256) if necessary.
-      - Supporting a dry-run mode (using the -WhatIf switch) to simulate the operation without making any changes.
-      - Optionally verifying that the directory structure matches between the source and destination.
-      - Creating a backup of the destination folder before making changes (optional).
-      - Supporting selective transfers of specific data types (saves, mods, etc.).
-      - Providing progress reporting during the file transfer process.
-      - Offering parallel processing for improved performance.
-      - Processing files as a stream to minimize memory usage.
+      - Using a streaming approach to process files in small batches
+      - Skipping files that match default or user-specified blacklist patterns
+      - Comparing file metadata (size and last modification time) and computing file hashes (SHA256) if necessary
+      - Supporting a dry-run mode (using the -WhatIf switch) to simulate the operation without making any changes
+      - Optionally verifying that the directory structure matches between the source and destination
+      - Creating a backup of the destination folder before making changes (optional)
+      - Supporting selective transfers of specific data types (saves, mods, etc.)
+      - Providing progress reporting during the file transfer process
+      - Offering parallel processing for improved performance
+      - Processing files as a stream to minimize memory usage
+      - Using aggressive garbage collection to prevent memory bloat
 
 .PARAMETERS
     -SourcePath
@@ -51,6 +55,7 @@
         (Optional) Maximum number of parallel file copy operations. Default is 4.
     -BatchSize
         (Optional) Number of files to process in each batch. Default is 100.
+        For large transfers, this will be automatically reduced to conserve memory.
 
 .EXAMPLE
     # Dry-run (simulate) the transfer, using the default blacklist:
@@ -69,6 +74,7 @@
     - System-specific files (like Config.log, GameVersion.txt, cache files, and most ConfigOverride files)
       are excluded by default to protect the new computer's configuration.
     - Adjust the process name in the Check-SimsRunning function if needed.
+    - This script is optimized for memory efficiency when handling large file sets.
 #>
 
 param(
@@ -458,8 +464,29 @@ function Backup-DestinationFolder {
         
         if (-not $WhatIf) {
             try {
-                Copy-Item -Path $normalizedPath -Destination $backupFolder -Recurse -Force -ErrorAction Stop
-                Write-Log "Backup completed successfully."
+                # Use robocopy for more efficient backups of large directories
+                if ((Get-Command robocopy -ErrorAction SilentlyContinue)) {
+                    # Create the target directory
+                    New-Item -Path $backupFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null
+                    
+                    # Use robocopy with /MIR to mirror the directory
+                    # /MT for multithreaded copies, /NFL for no file list, /NDL for no directory list, /NJH no job header
+                    $result = Start-Process -FilePath "robocopy.exe" -ArgumentList "`"$normalizedPath`" `"$backupFolder`" /E /MIR /MT:8 /NFL /NDL /NJH /NJS" -NoNewWindow -Wait -PassThru
+                    
+                    # Robocopy returns non-zero exit codes for successful operations
+                    if ($result.ExitCode -ge 8) {
+                        Write-Log "Robocopy reported errors during backup (exit code $($result.ExitCode)). Falling back to PowerShell copy." -Level Warning
+                        Copy-Item -Path $normalizedPath -Destination $backupFolder -Recurse -Force -ErrorAction Stop
+                    }
+                    else {
+                        Write-Log "Backup completed successfully using robocopy."
+                    }
+                }
+                else {
+                    # Fallback to PowerShell's Copy-Item
+                    Copy-Item -Path $normalizedPath -Destination $backupFolder -Recurse -Force -ErrorAction Stop
+                    Write-Log "Backup completed successfully using PowerShell copy."
+                }
             }
             catch {
                 Write-Log "Failed to create backup: $_" -Level Error
@@ -520,318 +547,63 @@ function Invoke-SpecialFileHandler {
     }
 }
 
-# Function: Start-FileBatchProcessing
-# Processes a batch of files for transfer
-# Function: Start-FileBatchProcessing
-# Processes a batch of files for transfer
-# Function: Start-FileBatchProcessing
-# Processes a batch of files for transfer
-function Start-FileBatchProcessing {
-    param (
-        [System.IO.FileInfo[]]$FileBatch,
-        [string]$SourceRoot,
-        [string]$DestinationRoot,
-        [string[]]$BlacklistPatterns,
-        [bool]$IsWhatIf,
-        [bool]$UseForce
-    )
-    
-    $batchJobs = New-Object System.Collections.ArrayList
-    
-    foreach ($file in $FileBatch) {
-        if ($null -eq $file) {
-            Write-Log "Null file encountered in batch processing. Skipping." -Level Warning
-            continue
-        }
-        
-        if ([string]::IsNullOrWhiteSpace($file.FullName)) {
-            Write-Log "File with empty path encountered. Skipping." -Level Warning
-            continue
-        }
-        
-        if (-not (Test-Path -Path $file.FullName -PathType Leaf)) {
-            Write-Log "File no longer exists: $($file.FullName). Skipping." -Level Warning
-            continue
-        }
-        
-        # Compute the file's relative path with improved error handling
-        $relativePath = Get-RelativePath -BasePath $SourceRoot -FullPath $file.FullName
-        
-        if ([string]::IsNullOrWhiteSpace($relativePath)) {
-            Write-Log "Could not determine relative path for '$($file.FullName)'. Skipping file." -Level Error
-            $script:filesSkipped++
-            continue
-        }
-        
-        # Skip this file if it matches any blacklist pattern
-        if (Test-Blacklisted -RelativePath $relativePath -BlacklistPatterns $BlacklistPatterns) {
-            Write-Log "Skipping blacklisted file: $relativePath"
-            $script:filesSkipped++
-            continue
-        }
-        
-        # Skip this file if it doesn't match inclusion criteria
-        if (-not (Test-ShouldInclude -RelativePath $relativePath)) {
-            $script:filesSkipped++
-            continue
-        }
-        
-        # Only increment processed files counter AFTER all filtering is complete
-        $script:filesProcessed++
-        
-        # Build the full destination file path using the safe join function
-        $destFile = Join-PathSafely -Path $DestinationRoot -ChildPath $relativePath
-        
-        if ([string]::IsNullOrWhiteSpace($destFile)) {
-            Write-Log "Could not construct destination path for '$relativePath'. Skipping file." -Level Error
-            $script:filesSkipped++
-            continue
-        }
-        
-        # Ensure the destination directory exists
-        $destDir = Split-Path -Path $destFile -Parent
-        if ([string]::IsNullOrWhiteSpace($destDir)) {
-            Write-Log "Could not determine parent directory for '$destFile'. Skipping file." -Level Error
-            $script:filesSkipped++
-            continue
-        }
-        
-        $dirCreated = New-DirectorySafely -Path $destDir -IsWhatIf $IsWhatIf
-        if (-not $dirCreated -and -not $IsWhatIf) {
-            Write-Log "Failed to create directory '$destDir'. Skipping file '$relativePath'." -Level Error
-            $script:filesWithErrors++
-            continue
-        }
-        
-        # Decide if the file should be copied
-        $copyFile = $true
-        
-        # If the file exists in the destination, compare metadata and file hash
-        if (Test-Path -Path $destFile) {
-            try {
-                $destInfo = Get-Item -Path $destFile
-                # First, compare file size and last write time
-                if (($file.Length -eq $destInfo.Length) -and ($file.LastWriteTime -eq $destInfo.LastWriteTime)) {
-                    # If metadata matches, compute hashes to confirm file content
-                    $srcHash = (Get-FileHash -Path $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
-                    $destHash = (Get-FileHash -Path $destFile -Algorithm SHA256 -ErrorAction Stop).Hash
-                    if ($srcHash -eq $destHash) {
-                        Write-Log "Skipping identical file: $relativePath (metadata and hash match)"
-                        $script:filesSkipped++
-                        $copyFile = $false
-                    }
-                    else {
-                        Write-Log "File $relativePath has matching metadata but different hash. Will copy file."
-                    }
-                }
-                else {
-                    # If metadata differs, still do a hash check
-                    $srcHash = (Get-FileHash -Path $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
-                    $destHash = (Get-FileHash -Path $destFile -Algorithm SHA256 -ErrorAction Stop).Hash
-                    if ($srcHash -eq $destHash) {
-                        Write-Log "Skipping file: $relativePath (hashes match despite metadata differences)"
-                        $script:filesSkipped++
-                        $copyFile = $false
-                    }
-                    else {
-                        Write-Log "File $relativePath differs (metadata or hash mismatch). Will copy file."
-                    }
-                }
-            }
-            catch {
-                Write-Log "Error comparing files for '$relativePath': $_. Will copy file." -Level Warning
-            }
-        }
-        else {
-            Write-Log "File $relativePath does not exist in destination. Will copy file."
-        }
-        
-        # If file needs to be copied, perform the copy operation
-        if ($copyFile) {
-            if ($IsWhatIf) {
-                Write-Log "Would copy file: $relativePath (WhatIf mode)"
-                $script:filesCopied++
-            } else {
-                # Start a background job for this file
-                $job = Start-Job -ScriptBlock {
-                    param($src, $dest, $force)
-                    try {
-                        # Ensure destination directory exists (for safety)
-                        $destDir = Split-Path -Path $dest -Parent
-                        if (-not (Test-Path -Path $destDir)) {
-                            New-Item -Path $destDir -ItemType Directory -Force | Out-Null
-                        }
-                        
-                        if ($force) {
-                            Copy-Item -Path $src -Destination $dest -Force
-                        } else {
-                            Copy-Item -Path $src -Destination $dest
-                        }
-                        return @{Success = $true; Path = $dest}
-                    } catch {
-                        return @{Success = $false; Path = $dest; Error = $_.Exception.Message}
-                    }
-                } -ArgumentList $file.FullName, $destFile, $UseForce
-                
-                [void]$batchJobs.Add(@{
-                    Job = $job
-                    RelativePath = $relativePath
-                    DestFile = $destFile
-                })
-            }
-        }
-    }
-    
-    return $batchJobs
-}
-
-# Function: Wait-ForCompletedJobs
-# Waits for jobs to complete and processes their results
-function Wait-ForCompletedJobs {
-    param (
-        [array]$Jobs,
-        [bool]$WaitForAll = $false
-    )
-    
-    $completedJobs = @()
-    
-    foreach ($jobInfo in $Jobs) {
-        if ($null -eq $jobInfo -or $null -eq $jobInfo.Job) {
-            continue
-        }
-        
-        if ($jobInfo.Job.State -ne "Running" -or $WaitForAll) {
-            if ($WaitForAll -and $jobInfo.Job.State -eq "Running") {
-                $jobInfo.Job | Wait-Job | Out-Null
-            }
-            
-            try {
-                $result = Receive-Job -Job $jobInfo.Job -ErrorAction Stop
-                if ($result.Success) {
-                    Write-Log "Copied file: $($jobInfo.RelativePath)"
-                    Invoke-SpecialFileHandler -FilePath $jobInfo.DestFile
-                    $script:filesCopied++
-                } else {
-                    Write-Log "Error copying file '$($jobInfo.RelativePath)': $($result.Error)" -Level Error
-                    $script:filesWithErrors++
-                }
-            }
-            catch {
-                Write-Log "Error processing job for '$($jobInfo.RelativePath)': $_" -Level Error
-                $script:filesWithErrors++
-            }
-            finally {
-                Remove-Job -Job $jobInfo.Job -Force -ErrorAction SilentlyContinue
-            }
-            
-            $completedJobs += $jobInfo
-        }
-    }
-    
-    # Remove completed jobs from the tracking array
-    $remainingJobs = @()
-    foreach ($job in $Jobs) {
-        if (-not $completedJobs.Contains($job)) {
-            $remainingJobs += $job
-        }
-    }
-    
-    return $remainingJobs
-}
-
-# Function: Start-DirectoryProcessing
-# Processes directories safely with improved error handling
-function Start-DirectoryProcessing {
+# New helper function for efficient file count
+function Get-DirectoryFileCount {
     param (
         [string]$Directory,
-        [string]$SourceRoot,
-        [string]$DestinationRoot,
-        [string[]]$BlacklistPatterns,
-        [bool]$IsWhatIf,
-        [bool]$UseForce,
-        [int]$BatchSize,
-        [ref]$ActiveJobsRef,
-        [int]$MaxParallelJobs
+        [string]$RootPath,
+        [string[]]$IncludePatterns,
+        [string[]]$ExcludePatterns
     )
     
-    if (-not (Test-PathAndLog -Path $Directory -Description "Directory to process")) {
-        return
-    }
+    $count = 0
     
-    $normalizedDirectory = Convert-PathFormat -Path $Directory
-    $normalizedSourceRoot = Convert-PathFormat -Path $SourceRoot
-    $normalizedDestinationRoot = Convert-PathFormat -Path $DestinationRoot
+    # Use a stack instead of a queue to reduce memory pressure
+    $dirStack = New-Object System.Collections.Generic.Stack[string]
+    $dirStack.Push($Directory)
     
-    Write-Log "Processing directory: $normalizedDirectory"
-    
-    # Use a queue to process directories without recursion
-    $dirQueue = New-Object System.Collections.Queue
-    $dirQueue.Enqueue($normalizedDirectory)
-    
-    while ($dirQueue.Count -gt 0) {
-        $currentDir = $dirQueue.Dequeue()
+    while ($dirStack.Count -gt 0) {
+        $currentDir = $dirStack.Pop()
         
         if (-not (Test-Path -Path $currentDir -PathType Container)) {
-            Write-Log "Directory no longer exists: $currentDir. Skipping." -Level Warning
             continue
         }
         
-        # Get files in current directory (non-recursive)
-        $currentBatch = @()
         try {
-            $files = Get-ChildItem -Path $currentDir -File -ErrorAction Stop
-            
-            # Add files to the current batch
-            $currentBatch += $files
-        }
-        catch {
-            Write-Log "Error reading files in directory '$currentDir': $_. Skipping directory." -Level Error
-            continue
-        }
-        
-        # Process the batch if it's full or if we've exhausted files in this directory
-        if ($currentBatch.Count -ge $BatchSize) {
-            # Process this batch of files
-            $newJobs = Start-FileBatchProcessing -FileBatch $currentBatch -SourceRoot $normalizedSourceRoot -DestinationRoot $normalizedDestinationRoot -BlacklistPatterns $BlacklistPatterns -IsWhatIf $IsWhatIf -UseForce $UseForce
-            $ActiveJobsRef.Value += $newJobs
-            $currentBatch = @()
-            
-            # Update progress
-            $percentComplete = [int](($script:filesProcessed / $script:totalFiles) * 100)
-            Write-Progress -Activity "Transferring Sims 4 Files" -Status "Processing $($script:filesProcessed) of $($script:totalFiles)" -PercentComplete $percentComplete
-            
-            # Wait for jobs to complete if we've reached the max
-            while ($ActiveJobsRef.Value.Count -ge $MaxParallelJobs) {
-                Start-Sleep -Milliseconds 100
-                $ActiveJobsRef.Value = Wait-ForCompletedJobs -Jobs $ActiveJobsRef.Value
+            # Get files in chunks to avoid loading too many at once
+            Get-ChildItem -Path $currentDir -File -ErrorAction Stop | ForEach-Object {
+                $file = $_
+                if ($null -eq $file) { return }
+                
+                if ([string]::IsNullOrWhiteSpace($file.FullName)) { return }
+                
+                $relativePath = Get-RelativePath -BasePath $RootPath -FullPath $file.FullName
+                if ([string]::IsNullOrWhiteSpace($relativePath)) { return }
+                
+                if (Test-ShouldCount -Path $relativePath -IncludePatterns $IncludePatterns -ExcludePatterns $ExcludePatterns) {
+                    $count++
+                }
+                
+                # Clear variable to help with garbage collection
+                $file = $null
             }
-        }
-        
-        # Queue subdirectories for processing
-        try {
-            $subDirs = Get-ChildItem -Path $currentDir -Directory -ErrorAction Stop
-            foreach ($subDir in $subDirs) {
-                $dirQueue.Enqueue($subDir.FullName)
+            
+            # Add subdirectories to the stack
+            Get-ChildItem -Path $currentDir -Directory -ErrorAction Stop | ForEach-Object {
+                if (-not [string]::IsNullOrWhiteSpace($_.FullName)) {
+                    $dirStack.Push($_.FullName)
+                }
             }
         }
         catch {
-            Write-Log "Error reading subdirectories in '$currentDir': $_. Skipping subdirectories." -Level Error
-        }
-        
-        # Process any remaining files in the batch
-        if ($currentBatch.Count -gt 0) {
-            $newJobs = Start-FileBatchProcessing -FileBatch $currentBatch -SourceRoot $normalizedSourceRoot -DestinationRoot $normalizedDestinationRoot -BlacklistPatterns $BlacklistPatterns -IsWhatIf $IsWhatIf -UseForce $UseForce
-            $ActiveJobsRef.Value += $newJobs
-            
-            # Update progress
-            $percentComplete = [int](($script:filesProcessed / $script:totalFiles) * 100)
-            Write-Progress -Activity "Transferring Sims 4 Files" -Status "Processing $($script:filesProcessed) of $($script:totalFiles)" -PercentComplete $percentComplete
+            Write-Log "Error processing directory '$currentDir': $_. Skipping directory." -Level Error
         }
     }
+    
+    return $count
 }
 
-# Function: Get-TotalFileCount
-# Get the total number of files to be processed with improved path handling
+# Optimized version of Get-TotalFileCount
 function Get-TotalFileCount {
     param (
         [string]$Path,
@@ -857,30 +629,36 @@ function Get-TotalFileCount {
         if ($TransferOptions) { $includePatterns += "*Options.ini*" }
     }
     
-    # Determine which directories to process
-    $directoriesToProcess = New-Object System.Collections.Queue
-    
+    # Process selectively by directory to reduce memory usage
     if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots) {
-        # Only add selected directories
+        # Only process selected directories
         if ($TransferSaves) { 
             $savesDir = Join-PathSafely -Path $normalizedPath -ChildPath "Saves"
-            if (Test-Path -Path $savesDir) { $directoriesToProcess.Enqueue($savesDir) }
+            if (Test-Path -Path $savesDir) {
+                $count += Get-DirectoryFileCount -Directory $savesDir -RootPath $normalizedPath -IncludePatterns $includePatterns -ExcludePatterns $BlacklistPatterns
+            }
         }
         if ($TransferMods) { 
             $modsDir = Join-PathSafely -Path $normalizedPath -ChildPath "Mods"
-            if (Test-Path -Path $modsDir) { $directoriesToProcess.Enqueue($modsDir) }
+            if (Test-Path -Path $modsDir) {
+                $count += Get-DirectoryFileCount -Directory $modsDir -RootPath $normalizedPath -IncludePatterns $includePatterns -ExcludePatterns $BlacklistPatterns
+            }
         }
         if ($TransferTray) { 
             $trayDir = Join-PathSafely -Path $normalizedPath -ChildPath "Tray"
-            if (Test-Path -Path $trayDir) { $directoriesToProcess.Enqueue($trayDir) }
+            if (Test-Path -Path $trayDir) {
+                $count += Get-DirectoryFileCount -Directory $trayDir -RootPath $normalizedPath -IncludePatterns $includePatterns -ExcludePatterns $BlacklistPatterns
+            }
         }
         if ($TransferScreenshots) { 
             $screenshotsDir = Join-PathSafely -Path $normalizedPath -ChildPath "Screenshots"
-            if (Test-Path -Path $screenshotsDir) { $directoriesToProcess.Enqueue($screenshotsDir) }
+            if (Test-Path -Path $screenshotsDir) {
+                $count += Get-DirectoryFileCount -Directory $screenshotsDir -RootPath $normalizedPath -IncludePatterns $includePatterns -ExcludePatterns $BlacklistPatterns
+            }
         }
     } else {
         # Process everything
-        $directoriesToProcess.Enqueue($normalizedPath)
+        $count += Get-DirectoryFileCount -Directory $normalizedPath -RootPath $normalizedPath -IncludePatterns $includePatterns -ExcludePatterns $BlacklistPatterns
     }
     
     # Add the Options.ini file separately if needed
@@ -891,61 +669,111 @@ function Get-TotalFileCount {
         }
     }
     
-    # Process the directory queue
-    while ($directoriesToProcess.Count -gt 0) {
-        $currentDir = $directoriesToProcess.Dequeue()
-        
-        if ([string]::IsNullOrWhiteSpace($currentDir)) {
-            Write-Log "Empty directory path encountered in queue. Skipping." -Level Warning
-            continue
-        }
+    return $count
+}
+
+# Modified Start-DirectoryProcessing function
+function Start-DirectoryProcessing {
+    param (
+        [string]$Directory,
+        [string]$SourceRoot,
+        [string]$DestinationRoot,
+        [string[]]$BlacklistPatterns,
+        [bool]$IsWhatIf,
+        [bool]$UseForce,
+        [int]$BatchSize,
+        [ref]$ActiveJobsRef,
+        [int]$MaxParallelJobs
+    )
+    
+    if (-not (Test-PathAndLog -Path $Directory -Description "Directory to process")) {
+        return
+    }
+    
+    $normalizedDirectory = Convert-PathFormat -Path $Directory
+    $normalizedSourceRoot = Convert-PathFormat -Path $SourceRoot
+    $normalizedDestinationRoot = Convert-PathFormat -Path $DestinationRoot
+    
+    Write-Log "Processing directory: $normalizedDirectory"
+    
+    # Use a stack instead of a queue for better memory management
+    $dirStack = New-Object System.Collections.Generic.Stack[string]
+    $dirStack.Push($normalizedDirectory)
+    
+    # Reduce batch size for large transfers
+    $effectiveBatchSize = [Math]::Min($BatchSize, 20)
+    
+    while ($dirStack.Count -gt 0) {
+        $currentDir = $dirStack.Pop()
         
         if (-not (Test-Path -Path $currentDir -PathType Container)) {
             Write-Log "Directory no longer exists: $currentDir. Skipping." -Level Warning
             continue
         }
         
+        # Get files in current directory - process them in smaller batches
+        $batchCount = 0
+        $currentBatch = @()
+        
         try {
-            # Get all files in this directory (non-recursive)
-            $files = Get-ChildItem -Path $currentDir -File -ErrorAction Stop
-            
-            # Count files that aren't blacklisted
-            foreach ($file in $files) {
-                if ($null -eq $file) { continue }
+            # Process files in smaller chunks
+            Get-ChildItem -Path $currentDir -File -ErrorAction Stop | ForEach-Object {
+                $file = $_
                 
-                if ([string]::IsNullOrWhiteSpace($file.FullName)) {
-                    Write-Log "File with empty path encountered in '$currentDir'. Skipping." -Level Warning
-                    continue
-                }
+                # Add file to current batch
+                $currentBatch += $file
+                $batchCount++
                 
-                $relativePath = Get-RelativePath -BasePath $normalizedPath -FullPath $file.FullName
-                if ([string]::IsNullOrWhiteSpace($relativePath)) {
-                    Write-Log "Computed relative path is empty for file $($file.FullName). Skipping." -Level Warning
-                    continue
-                }
-                
-                if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $BlacklistPatterns) {
-                    $count++
+                # Process batch if it's reached the size limit
+                if ($batchCount -ge $effectiveBatchSize) {
+                    # Process this batch of files
+                    $newJobs = Start-FileBatchProcessing -FileBatch $currentBatch -SourceRoot $normalizedSourceRoot -DestinationRoot $normalizedDestinationRoot -BlacklistPatterns $BlacklistPatterns -IsWhatIf $IsWhatIf -UseForce $UseForce
+                    
+                    # Use batched job processing
+                    Start-BatchedJobs -Jobs $newJobs -ActiveJobsRef $ActiveJobsRef -MaxJobs $MaxParallelJobs
+                    
+                    # Clear the batch array to free memory
+                    $currentBatch = @()
+                    $batchCount = 0
+                    
+                    # Update progress
+                    $percentComplete = if ($script:totalFiles -gt 0) { [int](($script:filesProcessed / $script:totalFiles) * 100) } else { 0 }
+                    Write-Progress -Activity "Transferring Sims 4 Files" -Status "Processing $($script:filesProcessed) of $($script:totalFiles)" -PercentComplete $percentComplete
                 }
             }
             
-            # Queue subdirectories for processing
-            $subdirs = Get-ChildItem -Path $currentDir -Directory -ErrorAction Stop
-            foreach ($subdir in $subdirs) {
-                if (-not [string]::IsNullOrWhiteSpace($subdir.FullName)) {
-                    $directoriesToProcess.Enqueue($subdir.FullName)
+            # Process any remaining files in the batch
+            if ($currentBatch.Count -gt 0) {
+                $newJobs = Start-FileBatchProcessing -FileBatch $currentBatch -SourceRoot $normalizedSourceRoot -DestinationRoot $normalizedDestinationRoot -BlacklistPatterns $BlacklistPatterns -IsWhatIf $IsWhatIf -UseForce $UseForce
+                
+                # Use batched job processing
+                Start-BatchedJobs -Jobs $newJobs -ActiveJobsRef $ActiveJobsRef -MaxJobs $MaxParallelJobs
+                
+                # Clear the batch array to free memory
+                $currentBatch = @()
+                
+                # Update progress
+                $percentComplete = if ($script:totalFiles -gt 0) { [int](($script:filesProcessed / $script:totalFiles) * 100) } else { 0 }
+                Write-Progress -Activity "Transferring Sims 4 Files" -Status "Processing $($script:filesProcessed) of $($script:totalFiles)" -PercentComplete $percentComplete
+            }
+            
+            # Queue subdirectories for processing - do after processing files to reduce memory usage
+            Get-ChildItem -Path $currentDir -Directory -ErrorAction Stop | ForEach-Object {
+                if (-not [string]::IsNullOrWhiteSpace($_.FullName)) {
+                    $dirStack.Push($_.FullName)
                 }
             }
+            
+            # Force garbage collection between directories to free memory
+            [System.GC]::Collect()
         }
         catch {
             Write-Log "Error processing directory '$currentDir': $_. Skipping directory." -Level Error
         }
     }
-    
-    return $count
 }
-# Function: Compare-DirectoryStructures
-# Compares source and destination directory structures with improved path handling
+
+# Function to compare directory structures efficiently
 function Compare-DirectoryStructures {
     param (
         [string]$SourcePath,
@@ -968,99 +796,81 @@ function Compare-DirectoryStructures {
         return
     }
     
-    # Get source relative paths
-    $sourceRelativePaths = @()
-    
-    try {
-        $sourceQueue = New-Object System.Collections.Queue
-        $sourceQueue.Enqueue($normalizedSourcePath)
-        
-        while ($sourceQueue.Count -gt 0) {
-            $dir = $sourceQueue.Dequeue()
-            
-            if (-not (Test-Path -Path $dir -PathType Container)) {
-                continue
-            }
-            
-            $files = Get-ChildItem -Path $dir -File -ErrorAction Stop
-            
-            foreach ($file in $files) {
-                if ($null -eq $file) { continue }
-                
-                $relativePath = Get-RelativePath -BasePath $normalizedSourcePath -FullPath $file.FullName
-                if ([string]::IsNullOrEmpty($relativePath)) { continue }
-                
-                if (Test-ShouldCount -Path $relativePath -IncludePatterns $IncludePatterns -ExcludePatterns $ExcludePatterns) {
-                    $sourceRelativePaths += $relativePath
-                }
-            }
-            
-            $subDirs = Get-ChildItem -Path $dir -Directory -ErrorAction Stop
-            foreach ($subDir in $subDirs) {
-                $sourceQueue.Enqueue($subDir.FullName)
-            }
-        }
-    }
-    catch {
-        Write-Log "Error collecting source paths: $_" -Level Error
-    }
-    
     # Skip destination comparison in WhatIf mode
     if ($IsWhatIf) {
         Write-Log "Skipping destination structure verification in WhatIf mode."
         return
     }
     
-    # Get destination relative paths
-    $destRelativePaths = @()
+    Write-Log "Comparing directory structures (this may take some time for large directories)..."
     
-    try {
-        $destQueue = New-Object System.Collections.Queue
-        $destQueue.Enqueue($normalizedDestinationPath)
+    # Use more memory-efficient approach by comparing files one by one
+    $missingFiles = New-Object System.Collections.ArrayList
+    $extraFiles = New-Object System.Collections.ArrayList
+    
+    # Process source files using a stack-based approach
+    $sourceStack = New-Object System.Collections.Generic.Stack[string]
+    $sourceStack.Push($normalizedSourcePath)
+    
+    while ($sourceStack.Count -gt 0) {
+        $currentDir = $sourceStack.Pop()
         
-        while ($destQueue.Count -gt 0) {
-            $dir = $destQueue.Dequeue()
+        if (-not (Test-Path -Path $currentDir -PathType Container)) {
+            continue
+        }
+        
+        # Process files in the current directory
+        Get-ChildItem -Path $currentDir -File -ErrorAction SilentlyContinue | ForEach-Object {
+            $file = $_
+            $relativePath = Get-RelativePath -BasePath $normalizedSourcePath -FullPath $file.FullName
             
-            if (-not (Test-Path -Path $dir -PathType Container)) {
-                continue
-            }
+            if ([string]::IsNullOrEmpty($relativePath)) { return }
             
-            $files = Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue
-            
-            foreach ($file in $files) {
-                if ($null -eq $file) { continue }
+            if (Test-ShouldCount -Path $relativePath -IncludePatterns $IncludePatterns -ExcludePatterns $ExcludePatterns) {
+                $destFilePath = Join-PathSafely -Path $normalizedDestinationPath -ChildPath $relativePath
                 
-                $relativePath = Get-RelativePath -BasePath $normalizedDestinationPath -FullPath $file.FullName
-                if ([string]::IsNullOrEmpty($relativePath)) { continue }
-                
-                if (Test-ShouldCount -Path $relativePath -IncludePatterns $IncludePatterns -ExcludePatterns $ExcludePatterns) {
-                    $destRelativePaths += $relativePath
+                if (-not (Test-Path -Path $destFilePath -PathType Leaf)) {
+                    [void]$missingFiles.Add($relativePath)
                 }
             }
+        }
+        
+        # Queue subdirectories for processing
+        Get-ChildItem -Path $currentDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $sourceStack.Push($_.FullName)
+        }
+    }
+    
+    # Process destination files to find extras
+    $destStack = New-Object System.Collections.Generic.Stack[string]
+    $destStack.Push($normalizedDestinationPath)
+    
+    while ($destStack.Count -gt 0) {
+        $currentDir = $destStack.Pop()
+        
+        if (-not (Test-Path -Path $currentDir -PathType Container)) {
+            continue
+        }
+        
+        # Process files in the current directory
+        Get-ChildItem -Path $currentDir -File -ErrorAction SilentlyContinue | ForEach-Object {
+            $file = $_
+            $relativePath = Get-RelativePath -BasePath $normalizedDestinationPath -FullPath $file.FullName
             
-            $subDirs = Get-ChildItem -Path $dir -Directory -ErrorAction SilentlyContinue
-            foreach ($subDir in $subDirs) {
-                $destQueue.Enqueue($subDir.FullName)
+            if ([string]::IsNullOrEmpty($relativePath)) { return }
+            
+            if (Test-ShouldCount -Path $relativePath -IncludePatterns $IncludePatterns -ExcludePatterns $ExcludePatterns) {
+                $srcFilePath = Join-PathSafely -Path $normalizedSourcePath -ChildPath $relativePath
+                
+                if (-not (Test-Path -Path $srcFilePath -PathType Leaf)) {
+                    [void]$extraFiles.Add($relativePath)
+                }
             }
         }
-    }
-    catch {
-        Write-Log "Error collecting destination paths: $_" -Level Error
-    }
-    
-    # Compare source and destination paths
-    $missingFiles = @()
-    $extraFiles = @()
-    
-    foreach ($path in $sourceRelativePaths) {
-        if ($destRelativePaths -notcontains $path) {
-            $missingFiles += $path
-        }
-    }
-    
-    foreach ($path in $destRelativePaths) {
-        if ($sourceRelativePaths -notcontains $path) {
-            $extraFiles += $path
+        
+        # Queue subdirectories for processing
+        Get-ChildItem -Path $currentDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $destStack.Push($_.FullName)
         }
     }
     
@@ -1083,14 +893,13 @@ function Compare-DirectoryStructures {
         Write-Log "Directory structure verification successful."
     }
     
-    return @{
-        MissingFiles = $missingFiles
-        ExtraFiles = $extraFiles
-    }
+    # Clean up
+    $missingFiles = $null
+    $extraFiles = $null
+    [System.GC]::Collect()
 }
 
-#endregion Helper Functions
-
+# Optimized version of Start-FileBatchProcessing
 #region Main Script Execution
 
 # Set default blacklist if user does not provide one.
@@ -1116,14 +925,14 @@ $normalizedSourcePath = Convert-PathFormat -Path $SourcePath
 $normalizedDestinationPath = Convert-PathFormat -Path $DestinationPath
 
 # Stats tracking variables
-$filesProcessed = 0
-$filesSkipped = 0
-$filesCopied = 0
-$filesWithErrors = 0
-$totalFiles = 0
+$script:filesProcessed = 0
+$script:filesSkipped = 0
+$script:filesCopied = 0
+$script:filesWithErrors = 0
+$script:totalFiles = 0
 
 # Begin Script Execution
-Write-Log "Starting Sims 4 data transfer..."
+Write-Log "Starting Sims 4 data transfer with memory-optimized processing..."
 Write-Log "Source: $normalizedSourcePath"
 Write-Log "Destination: $normalizedDestinationPath"
 
@@ -1168,8 +977,16 @@ if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots 
 }
 
 # Get an estimate of total files for progress reporting
-$totalFiles = Get-TotalFileCount -Path $normalizedSourcePath -BlacklistPatterns $Blacklist
-Write-Log "Estimated total files to process: $totalFiles"
+Write-Log "Counting files to process (this may take a moment for large directories)..."
+$script:totalFiles = Get-TotalFileCount -Path $normalizedSourcePath -BlacklistPatterns $Blacklist
+Write-Log "Estimated total files to process: $script:totalFiles"
+
+# If we have a large number of files, adjust the batch size to conserve memory
+if ($script:totalFiles -gt 5000) {
+    $originalBatchSize = $BatchSize
+    $BatchSize = [Math]::Min($BatchSize, 20)
+    Write-Log "Large file set detected ($script:totalFiles files). Reducing batch size from $originalBatchSize to $BatchSize to conserve memory."
+}
 
 # Create an array to track all active jobs
 $activeJobs = @()
@@ -1235,13 +1052,17 @@ if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots)
 }
 
 # Process each main directory using improved directory processing
+Write-Log "Starting file transfer..."
 foreach ($directory in $directories) {
     Start-DirectoryProcessing -Directory $directory -SourceRoot $normalizedSourcePath -DestinationRoot $normalizedDestinationPath -BlacklistPatterns $Blacklist -IsWhatIf $WhatIf -UseForce $Force -BatchSize $BatchSize -ActiveJobsRef $activeJobsRef -MaxParallelJobs $MaxParallelJobs
+    
+    # Force garbage collection between directories
+    [System.GC]::Collect()
 }
 
 # Wait for all remaining jobs to complete
 Write-Log "Waiting for remaining file copy operations to complete..."
-Wait-ForCompletedJobs -Jobs $activeJobs -WaitForAll $true
+$activeJobs = Wait-ForCompletedJobs -Jobs $activeJobs -WaitForAll $true
 
 # Ensure progress bar is completed
 Write-Progress -Activity "Transferring Sims 4 Files" -Status "Complete" -PercentComplete 100 -Completed
@@ -1265,13 +1086,272 @@ if ($VerifyStructure) {
 # Display summary
 Write-Log "Transfer Summary:"
 Write-Log "----------------"
-Write-Log "Files processed: $filesProcessed"
-Write-Log "Files copied: $filesCopied"
-Write-Log "Files skipped: $filesSkipped"
-if ($filesWithErrors -gt 0) {
-    Write-Log "Files with errors: $filesWithErrors" -Level Warning
+Write-Log "Files processed: $script:filesProcessed"
+Write-Log "Files copied: $script:filesCopied"
+Write-Log "Files skipped: $script:filesSkipped"
+if ($script:filesWithErrors -gt 0) {
+    Write-Log "Files with errors: $script:filesWithErrors" -Level Warning
 }
 Write-Log "----------------"
 Write-Log "Sims 4 data transfer completed."
 
+# Final cleanup
+[System.GC]::Collect()
+
 #endregion Main Script Execution
+
+# Function: Wait-ForCompletedJobs
+# Waits for jobs to complete and processes their results
+function Wait-ForCompletedJobs {
+    param (
+        [array]$Jobs,
+        [bool]$WaitForAll = $false
+    )
+    
+    $remainingJobs = @()
+    $jobsToReceive = @()
+    
+    # First identify which jobs are completed or need to be waited on
+    foreach ($job in $Jobs) {
+        if ($null -eq $job) {
+            continue
+        }
+        
+        if ($job.State -ne "Running" -or $WaitForAll) {
+            if ($WaitForAll -and $job.State -eq "Running") {
+                $job | Wait-Job | Out-Null
+            }
+            
+            $jobsToReceive += $job
+        }
+        else {
+            $remainingJobs += $job
+        }
+    }
+    
+    # Process all completed jobs in one batch
+    if ($jobsToReceive.Count -gt 0) {
+        try {
+            foreach ($job in $jobsToReceive) {
+                $result = Receive-Job -Job $job -ErrorAction Stop
+                
+                # The jobs now return an array of results, handle each one
+                if ($result -is [System.Collections.IEnumerable] -and -not ($result -is [string])) {
+                    foreach ($item in $result) {
+                        if ($null -eq $item) { continue }
+                        
+                        if ($item.Success) {
+                            Write-Log "Copied file: $($item.RelativePath)"
+                            $script:filesCopied++
+                        }
+                        else {
+                            Write-Log "Error copying file '$($item.RelativePath)': $($item.Error)" -Level Error
+                            $script:filesWithErrors++
+                        }
+                    }
+                }
+                elseif ($null -ne $result) {
+                    if ($result.Success) {
+                        Write-Log "Copied file: $($result.RelativePath)"
+                        $script:filesCopied++
+                    }
+                    else {
+                        Write-Log "Error copying file '$($result.RelativePath)': $($result.Error)" -Level Error
+                        $script:filesWithErrors++
+                    }
+                }
+                
+                # Remove the job immediately after processing
+                Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {
+            Write-Log "Error processing jobs: $_" -Level Error
+            
+            # Clean up the jobs even if there was an error
+            foreach ($job in $jobsToReceive) {
+                Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            }
+        }
+        
+        # Force garbage collection after processing a batch of jobs
+        [System.GC]::Collect()
+    }
+    
+    return $remainingJobs
+}
+
+# New function to handle job batching
+function Start-BatchedJobs {
+    param (
+        [System.Management.Automation.Job[]]$Jobs,
+        [ref]$ActiveJobsRef,
+        [int]$MaxJobs
+    )
+    
+    # Add new jobs to active jobs
+    $ActiveJobsRef.Value += $Jobs
+    
+    # Process completed jobs when we reach the maximum
+    if ($ActiveJobsRef.Value.Count -ge $MaxJobs) {
+        # Wait for at least some jobs to complete
+        Start-Sleep -Milliseconds 500
+        $ActiveJobsRef.Value = Wait-ForCompletedJobs -Jobs $ActiveJobsRef.Value
+        
+        # Force garbage collection
+        [System.GC]::Collect()
+    }
+}
+
+# Optimized version of Start-FileBatchProcessing
+function Start-FileBatchProcessing {
+    param (
+        [System.IO.FileInfo[]]$FileBatch,
+        [string]$SourceRoot,
+        [string]$DestinationRoot,
+        [string[]]$BlacklistPatterns,
+        [bool]$IsWhatIf,
+        [bool]$UseForce
+    )
+    
+    $batchJobs = New-Object System.Collections.ArrayList
+    
+    foreach ($file in $FileBatch) {
+        if ($null -eq $file) {
+            Write-Log "Null file encountered in batch processing. Skipping." -Level Warning
+            continue
+        }
+        
+        if ([string]::IsNullOrWhiteSpace($file.FullName)) {
+            Write-Log "File with empty path encountered. Skipping." -Level Warning
+            continue
+        }
+        
+        if (-not (Test-Path -Path $file.FullName -PathType Leaf)) {
+            Write-Log "File no longer exists: $($file.FullName). Skipping." -Level Warning
+            continue
+        }
+        
+        # Compute the file's relative path with improved error handling
+        $relativePath = Get-RelativePath -BasePath $SourceRoot -FullPath $file.FullName
+        
+        if ([string]::IsNullOrWhiteSpace($relativePath)) {
+            Write-Log "Could not determine relative path for '$($file.FullName)'. Skipping file." -Level Error
+            $script:filesSkipped++
+            continue
+        }
+        
+        # Skip this file if it matches any blacklist pattern
+        if (Test-Blacklisted -RelativePath $relativePath -BlacklistPatterns $BlacklistPatterns) {
+            Write-Log "Skipping blacklisted file: $relativePath" -Level Info
+            $script:filesSkipped++
+            continue
+        }
+        
+        # Skip this file if it doesn't match inclusion criteria
+        if (-not (Test-ShouldInclude -RelativePath $relativePath)) {
+            $script:filesSkipped++
+            continue
+        }
+        
+        # Only increment processed files counter AFTER all filtering is complete
+        $script:filesProcessed++
+        
+        # Build the full destination file path using the safe join function
+        $destFile = Join-PathSafely -Path $DestinationRoot -ChildPath $relativePath
+        
+        if ([string]::IsNullOrWhiteSpace($destFile)) {
+            Write-Log "Could not construct destination path for '$relativePath'. Skipping file." -Level Error
+            $script:filesSkipped++
+            continue
+        }
+        
+        # Ensure the destination directory exists
+        $destDir = Split-Path -Path $destFile -Parent
+        if ([string]::IsNullOrWhiteSpace($destDir)) {
+            Write-Log "Could not determine parent directory for '$destFile'. Skipping file." -Level Error
+            $script:filesSkipped++
+            continue
+        }
+        
+        $dirCreated = New-DirectorySafely -Path $destDir -IsWhatIf $IsWhatIf
+        if (-not $dirCreated -and -not $IsWhatIf) {
+            Write-Log "Failed to create directory '$destDir'. Skipping file '$relativePath'." -Level Error
+            $script:filesWithErrors++
+            continue
+        }
+        
+        # Decide if the file should be copied
+        $copyFile = $true
+        
+        # If the file exists in the destination, compare metadata and file hash
+        if (Test-Path -Path $destFile) {
+            try {
+                $destInfo = Get-Item -Path $destFile
+                # First, compare file size and last write time - this is more memory efficient than computing hashes
+                if (($file.Length -eq $destInfo.Length) -and ($file.LastWriteTime -eq $destInfo.LastWriteTime)) {
+                    # Only compute hashes if metadata matches - reduces unnecessary hash calculations
+                    $srcHash = (Get-FileHash -Path $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+                    $destHash = (Get-FileHash -Path $destFile -Algorithm SHA256 -ErrorAction Stop).Hash
+                    if ($srcHash -eq $destHash) {
+                        Write-Log "Skipping identical file: $relativePath (metadata and hash match)"
+                        $script:filesSkipped++
+                        $copyFile = $false
+                    }
+                    else {
+                        Write-Log "File $relativePath has matching metadata but different hash. Will copy file."
+                    }
+                }
+                else {
+                    # File metadata differs - will copy the file
+                    Write-Log "File $relativePath differs (metadata mismatch). Will copy file."
+                }
+            }
+            catch {
+                Write-Log "Error comparing files for '$relativePath': $_. Will copy file." -Level Warning
+            }
+        }
+        else {
+            Write-Log "File $relativePath does not exist in destination. Will copy file."
+        }
+        
+        # If file needs to be copied, perform the copy operation
+        if ($copyFile) {
+            if ($IsWhatIf) {
+                Write-Log "Would copy file: $relativePath (WhatIf mode)"
+                $script:filesCopied++
+            } else {
+                # Start a background job for this file
+                $job = Start-Job -ScriptBlock {
+                    param($src, $dest, $force, $relativePath)
+                    try {
+                        # Ensure destination directory exists (for safety)
+                        $destDir = Split-Path -Path $dest -Parent
+                        if (-not (Test-Path -Path $destDir)) {
+                            New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+                        }
+                        
+                        if ($force) {
+                            Copy-Item -Path $src -Destination $dest -Force
+                        } else {
+                            Copy-Item -Path $src -Destination $dest
+                        }
+                        
+                        return @{Success = $true; Path = $dest; RelativePath = $relativePath}
+                    } catch {
+                        return @{Success = $false; Path = $dest; RelativePath = $relativePath; Error = $_.Exception.Message}
+                    }
+                } -ArgumentList $file.FullName, $destFile, $UseForce, $relativePath
+                
+                [void]$batchJobs.Add($job)
+            }
+        }
+        
+        # Clear variables to help with garbage collection
+        $destInfo = $null
+        $srcHash = $null
+        $destHash = $null
+    }
+    
+    return $batchJobs
+}
