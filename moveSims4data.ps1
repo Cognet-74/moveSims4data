@@ -54,13 +54,13 @@
 
 .EXAMPLE
     # Dry-run (simulate) the transfer, using the default blacklist:
-    .\Move-Sims4Data.ps1 -SourcePath "E:\Documents\Electronic Arts\The Sims 4" `
+    .\moveSims4data.ps1 -SourcePath "E:\Documents\Electronic Arts\The Sims 4" `
         -DestinationPath "C:\Users\UserName\Documents\Electronic Arts\The Sims 4" `
         -Force -VerifyStructure -Verbose -WhatIf
 
 .EXAMPLE
     # Transfer only mods and saves with backup:
-    .\Move-Sims4Data.ps1 -SourcePath "E:\Documents\Electronic Arts\The Sims 4" `
+    .\moveSims4data.ps1 -SourcePath "E:\Documents\Electronic Arts\The Sims 4" `
         -DestinationPath "C:\Users\UserName\Documents\Electronic Arts\The Sims 4" `
         -TransferMods -TransferSaves -Backup -Force
 
@@ -105,24 +105,7 @@ param(
     [int]$BatchSize = 100
 )
 
-# Set default blacklist if user does not provide one.
-# These patterns exclude files that are tied to the old system's configuration.
-if (-not $Blacklist) {
-    $Blacklist = @(
-        "*Config.log*",
-        "*GameVersion.txt*",
-        "*localthumbcache.package*",
-        "*avatarcache.package*",
-        "*\ConfigOverride\*"
-    )
-}
-
-# Stats tracking variables
-$filesProcessed = 0
-$filesSkipped = 0
-$filesCopied = 0
-$filesWithErrors = 0
-$totalFiles = 0
+#region Helper Functions
 
 # Function: Write-Log
 # Writes a message to the console and appends it to a log file if provided.
@@ -181,6 +164,71 @@ function Test-ShouldInclude {
     if ($TransferOptions -and $RelativePath -like "*Options.ini*") { return $true }
     
     return $false
+}
+
+# Function: Test-ShouldCount
+# Checks if a file should be counted in verification based on include/exclude patterns
+function Test-ShouldCount {
+    param (
+        [string]$Path,
+        [string[]]$IncludePatterns,
+        [string[]]$ExcludePatterns
+    )
+    
+    # If the file is blacklisted, don't count it
+    if ((Test-Blacklisted -RelativePath $Path -BlacklistPatterns $ExcludePatterns)) {
+        return $false
+    }
+    
+    # If we have include patterns and the file doesn't match any, don't count it
+    if ($IncludePatterns.Count -gt 0) {
+        $shouldInclude = $false
+        foreach ($pattern in $IncludePatterns) {
+            if ($Path -like $pattern) {
+                $shouldInclude = $true
+                break
+            }
+        }
+        return $shouldInclude
+    }
+    
+    # Default case: count the file
+    return $true
+}
+
+# Function: Get-RelativePath
+# Gets the relative path between two paths
+function Get-RelativePath {
+    param (
+        [string]$BasePath,
+        [string]$FullPath
+    )
+
+    # Check if FullPath or BasePath is empty or null
+    if ([string]::IsNullOrWhiteSpace($FullPath)) {
+        Write-Log "Warning: FullPath parameter is empty or null. Cannot compute relative path."
+        return ""
+    }
+    if ([string]::IsNullOrWhiteSpace($BasePath)) {
+        Write-Log "Warning: BasePath parameter is empty or null. Cannot compute relative path."
+        return ""
+    }
+
+    # Resolve the full paths
+    $basePath = (Resolve-Path $BasePath).Path
+    $fullPath = (Resolve-Path $FullPath).Path
+
+    # Ensure the base path ends with a directory separator
+    if (-not $basePath.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+        $basePath += [System.IO.Path]::DirectorySeparatorChar
+    }
+
+    $baseUri = New-Object System.Uri($basePath)
+    $fullUri = New-Object System.Uri($fullPath)
+    $relativeUri = $baseUri.MakeRelativeUri($fullUri)
+    $relativePath = [System.Uri]::UnescapeDataString($relativeUri.ToString())
+    # Convert URI separators to Windows path separators
+    return $relativePath -replace '/', '\'
 }
 
 # Function: Backup-DestinationFolder
@@ -242,42 +290,88 @@ function Invoke-SpecialFileHandler {
     }
 }
 
-# Function: Get-RelativePath
-# Gets the relative path between two paths
-function Get-RelativePath {
+# Function: Get-TotalFileCount
+# Get the total number of files to be processed (for progress reporting)
+function Get-TotalFileCount {
     param (
-        [string]$BasePath,
-        [string]$FullPath
+        [string]$Path,
+        [string[]]$BlacklistPatterns
     )
-
-    # Check if FullPath or BasePath is empty or null
-    if ([string]::IsNullOrWhiteSpace($FullPath)) {
-        Write-Log "Warning: FullPath parameter is empty or null. Cannot compute relative path."
-        return ""
+    
+    $count = 0
+    
+    # Count files matching the inclusion criteria
+    $directories = @($Path)
+    $i = 0
+    
+    # First, get all top-level directories to process
+    if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots) {
+        $directories = @()
+        if ($TransferSaves) { $directories += Join-Path $Path "Saves" }
+        if ($TransferMods) { $directories += Join-Path $Path "Mods" }
+        if ($TransferTray) { $directories += Join-Path $Path "Tray" }
+        if ($TransferScreenshots) { $directories += Join-Path $Path "Screenshots" }
     }
-    if ([string]::IsNullOrWhiteSpace($BasePath)) {
-        Write-Log "Warning: BasePath parameter is empty or null. Cannot compute relative path."
-        return ""
+    
+    # Add the Options.ini file separately if needed
+    if ($TransferOptions) {
+        $optionsFile = Join-Path $Path "Options.ini"
+        if (Test-Path $optionsFile) {
+            $count++
+        }
     }
-
-    # Resolve the full paths
-    $basePath = (Resolve-Path $BasePath).Path
-    $fullPath = (Resolve-Path $FullPath).Path
-
-    # Ensure the base path ends with a directory separator
-    if (-not $basePath.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
-        $basePath += [System.IO.Path]::DirectorySeparatorChar
+    
+    # Process each directory
+    while ($i -lt $directories.Count) {
+        $dir = $directories[$i]
+        $i++
+        
+        if ([string]::IsNullOrEmpty($dir)) {
+            Write-Log "Warning: 'dir' is null or empty. Skipping iteration."
+            continue
+        }
+        if (-not (Test-Path -Path $dir)) {
+            continue
+        }
+        
+        # Get all files in this directory (non-recursive)
+        $files = Get-ChildItem -Path $dir -File
+        
+        # Count files that aren't blacklisted
+        foreach ($file in $files) {
+            if ([string]::IsNullOrWhiteSpace($file.FullName)) {
+                Write-Log "Warning: file.FullName is empty, skipping file."
+                continue
+            }
+            
+            $relativePath = Get-RelativePath -BasePath $Path -FullPath $file.FullName
+            if ([string]::IsNullOrEmpty($relativePath)) {
+                Write-Log "Warning: Computed relative path is empty for file $($file.FullName), skipping."
+                continue
+            }
+            
+            # Create include patterns based on selective transfer options
+            $includePatterns = @()
+            if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots -or $TransferOptions) {
+                if ($TransferSaves) { $includePatterns += "*\Saves\*" }
+                if ($TransferMods) { $includePatterns += "*\Mods\*" }
+                if ($TransferTray) { $includePatterns += "*\Tray\*" }
+                if ($TransferScreenshots) { $includePatterns += "*\Screenshots\*" }
+                if ($TransferOptions) { $includePatterns += "*Options.ini*" }
+            }
+            
+            if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $BlacklistPatterns) {
+                $count++
+            }
+        }
+        
+        # Add subdirectories to the directories array
+        $subdirs = Get-ChildItem -Path $dir -Directory
+        $directories += $subdirs.FullName
     }
-
-    $baseUri = New-Object System.Uri($basePath)
-    $fullUri = New-Object System.Uri($fullPath)
-    $relativeUri = $baseUri.MakeRelativeUri($fullUri)
-    $relativePath = [System.Uri]::UnescapeDataString($relativeUri.ToString())
-    # Convert URI separators to Windows path separators
-    return $relativePath -replace '/', '\'
+    
+    return $count
 }
-
-
 
 # Function: Start-FileBatchProcessing
 # Processes a batch of files for transfer
@@ -297,9 +391,7 @@ function Start-FileBatchProcessing {
         $script:filesProcessed++
         
         # Compute the file's relative path
-        $relativePath = Get-RelativePath -Path $file.FullName -BasePath $SourceRoot
-
-        
+        $relativePath = Get-RelativePath -BasePath $SourceRoot -FullPath $file.FullName
         
         # Skip this file if it matches any blacklist pattern
         if (Test-Blacklisted -RelativePath $relativePath -BlacklistPatterns $BlacklistPatterns) {
@@ -319,28 +411,27 @@ function Start-FileBatchProcessing {
         
         # Ensure the destination directory exists
         $destDir = Split-Path $destFile -Parent
-if ($null -eq $destDir) {
-    Write-Log "Warning: Destination directory is null for file $($file.FullName). Skipping file."
-    $script:filesSkipped++
-    continue
-}
-if (-not (Test-Path -Path $destDir)) {
-    try {
-        if ($IsWhatIf) {
-            Write-Log "Would create directory: $destDir"
+        if ($null -eq $destDir) {
+            Write-Log "Warning: Destination directory is null for file $($file.FullName). Skipping file."
+            $script:filesSkipped++
+            continue
         }
-        else {
-            New-Item -Path $destDir -ItemType Directory -Force | Out-Null
-            Write-Log "Created directory: $destDir"
+        if (-not (Test-Path -Path $destDir)) {
+            try {
+                if ($IsWhatIf) {
+                    Write-Log "Would create directory: $destDir"
+                }
+                else {
+                    New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+                    Write-Log "Created directory: $destDir"
+                }
+            }
+            catch {
+                Write-Log "Error creating directory '$destDir': $_"
+                $script:filesWithErrors++
+                continue
+            }
         }
-    }
-    catch {
-        Write-Log "Error creating directory '$destDir': $_"
-        $script:filesWithErrors++
-        continue
-    }
-}
-
         
         # Decide if the file should be copied
         $copyFile = $true
@@ -450,79 +541,28 @@ function Wait-ForCompletedJobs {
     return $remainingJobs
 }
 
-# Function: Get-TotalFileCount
-# Get the total number of files to be processed (for progress reporting)
-function Get-TotalFileCount {
-    param (
-        [string]$Path,
-        [string[]]$BlacklistPatterns
+#endregion Helper Functions
+
+#region Main Script Execution
+
+# Set default blacklist if user does not provide one.
+# These patterns exclude files that are tied to the old system's configuration.
+if (-not $Blacklist) {
+    $Blacklist = @(
+        "*Config.log*",
+        "*GameVersion.txt*",
+        "*localthumbcache.package*",
+        "*avatarcache.package*",
+        "*\ConfigOverride\*"
     )
-    
-    $count = 0
-    
-    # Count files matching the inclusion criteria
-    $directories = @($Path)
-    $i = 0
-    
-    # First, get all top-level directories to process
-    if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots) {
-        $directories = @()
-        if ($TransferSaves) { $directories += Join-Path $Path "Saves" }
-        if ($TransferMods) { $directories += Join-Path $Path "Mods" }
-        if ($TransferTray) { $directories += Join-Path $Path "Tray" }
-        if ($TransferScreenshots) { $directories += Join-Path $Path "Screenshots" }
-    }
-    
-    # Add the Options.ini file separately if needed
-    if ($TransferOptions) {
-        $optionsFile = Join-Path $Path "Options.ini"
-        if (Test-Path $optionsFile) {
-            $count++
-        }
-    }
-    
-    # Process each directory
-    while ($i -lt $directories.Count) {
-        $dir = $directories[$i]
-        $i++
-        
-        if ([string]::IsNullOrEmpty($dir)) {
-            Write-Log "Warning: 'dir' is null or empty. Skipping iteration."
-            continue
-        }
-        if (-not (Test-Path -Path $dir)) {
-            continue
-        }
-        
-        # Get all files in this directory (non-recursive)
-        $files = Get-ChildItem -Path $dir -File
-        
-        # Count files that aren't blacklisted
-        foreach ($file in $files) {
-            if ([string]::IsNullOrWhiteSpace($file.FullName)) {
-                Write-Log "Warning: file.FullName is empty, skipping file."
-                continue
-            }
-            
-            $relativePath = Get-RelativePath -BasePath $DestinationPath -FullPath $file.FullName
-            if ([string]::IsNullOrEmpty($relativePath)) {
-                Write-Log "Warning: Computed relative path is empty for file $($file.FullName), skipping."
-                continue
-            }
-            
-            if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
-                $destRelativePaths += $relativePath
-            }
-        }
-        
-        
-        # Add subdirectories to the directories array
-        $subdirs = Get-ChildItem -Path $dir -Directory
-        $directories += $subdirs.FullName
-    }
-    
-    return $count
 }
+
+# Stats tracking variables
+$filesProcessed = 0
+$filesSkipped = 0
+$filesCopied = 0
+$filesWithErrors = 0
+$totalFiles = 0
 
 # Begin Script Execution
 Write-Log "Starting Sims 4 data transfer..."
@@ -569,7 +609,6 @@ if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots 
 }
 
 # Get an estimate of total files for progress reporting
-# (This is more efficient than a full recursive scan)
 $totalFiles = Get-TotalFileCount -Path $SourcePath -BlacklistPatterns $Blacklist
 Write-Log "Estimated total files to process: $totalFiles"
 
@@ -679,35 +718,6 @@ if (-not $WhatIf) {
         if ($TransferOptions) { $includePatterns += "*Options.ini*" }
     }
     
-    # Function to check if a file should be counted in verification
-    function Test-ShouldCount {
-        param (
-            [string]$Path,
-            [string[]]$IncludePatterns,
-            [string[]]$ExcludePatterns
-        )
-        
-        # If the file is blacklisted, don't count it
-        if ((Test-Blacklisted -RelativePath $Path -BlacklistPatterns $ExcludePatterns)) {
-            return $false
-        }
-        
-        # If we have include patterns and the file doesn't match any, don't count it
-        if ($IncludePatterns.Count -gt 0) {
-            $shouldInclude = $false
-            foreach ($pattern in $IncludePatterns) {
-                if ($Path -like $pattern) {
-                    $shouldInclude = $true
-                    break
-                }
-            }
-            return $shouldInclude
-        }
-        
-        # Default case: count the file
-        return $true
-    }
-    
     # Count source files
     $sourceCount = 0
     $sourceQueue = New-Object System.Collections.Queue
@@ -718,7 +728,7 @@ if (-not $WhatIf) {
         $files = Get-ChildItem -Path $dir -File
         
         foreach ($file in $files) {
-            $relativePath = Get-RelativePath -Path $file.FullName -BasePath $SourcePath
+            $relativePath = Get-RelativePath -BasePath $SourcePath -FullPath $file.FullName
             if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
                 $sourceCount++
             }
@@ -740,7 +750,7 @@ if (-not $WhatIf) {
         $files = Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue
         
         foreach ($file in $files) {
-            $relativePath = Get-RelativePath -Path $file.FullName -BasePath $DestinationPath
+            $relativePath = Get-RelativePath -BasePath $DestinationPath -FullPath $file.FullName
             if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
                 $destCount++
             }
@@ -785,7 +795,7 @@ if ($VerifyStructure -and (-not $WhatIf)) {
         $files = Get-ChildItem -Path $dir -File
         
         foreach ($file in $files) {
-            $relativePath = Get-RelativePath -Path $file.FullName -BasePath $SourcePath
+            $relativePath = Get-RelativePath -BasePath $SourcePath -FullPath $file.FullName
             if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
                 $sourceRelativePaths += $relativePath
             }
@@ -837,3 +847,4 @@ if ($VerifyStructure -and (-not $WhatIf)) {
         Write-Log "Directory structure verification successful."
     }
 }
+#endregion Main Script Execution
