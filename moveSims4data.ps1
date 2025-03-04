@@ -249,6 +249,17 @@ function Get-RelativePath {
         [string]$BasePath,
         [string]$FullPath
     )
+
+    # Check if FullPath or BasePath is empty or null
+    if ([string]::IsNullOrWhiteSpace($FullPath)) {
+        Write-Log "Warning: FullPath parameter is empty or null. Cannot compute relative path."
+        return ""
+    }
+    if ([string]::IsNullOrWhiteSpace($BasePath)) {
+        Write-Log "Warning: BasePath parameter is empty or null. Cannot compute relative path."
+        return ""
+    }
+
     # Resolve the full paths
     $basePath = (Resolve-Path $BasePath).Path
     $fullPath = (Resolve-Path $FullPath).Path
@@ -265,6 +276,7 @@ function Get-RelativePath {
     # Convert URI separators to Windows path separators
     return $relativePath -replace '/', '\'
 }
+
 
 
 # Function: Start-FileBatchProcessing
@@ -487,11 +499,22 @@ function Get-TotalFileCount {
         
         # Count files that aren't blacklisted
         foreach ($file in $files) {
-            $relativePath = Get-RelativePath -Path $file.FullName -BasePath $Path
-            if (-not (Test-Blacklisted -RelativePath $relativePath -BlacklistPatterns $BlacklistPatterns)) {
-                $count++
+            if ([string]::IsNullOrWhiteSpace($file.FullName)) {
+                Write-Log "Warning: file.FullName is empty, skipping file."
+                continue
+            }
+            
+            $relativePath = Get-RelativePath -BasePath $DestinationPath -FullPath $file.FullName
+            if ([string]::IsNullOrEmpty($relativePath)) {
+                Write-Log "Warning: Computed relative path is empty for file $($file.FullName), skipping."
+                continue
+            }
+            
+            if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
+                $destRelativePaths += $relativePath
             }
         }
+        
         
         # Add subdirectories to the directories array
         $subdirs = Get-ChildItem -Path $dir -Directory
