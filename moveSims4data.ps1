@@ -473,7 +473,7 @@ function Get-TotalFileCount {
         $dir = $directories[$i]
         $i++
         
-        if (-not (Test-Path $dir)) {
+        if ($null -eq $dir -or -not (Test-Path $dir)) {
             continue
         }
         
