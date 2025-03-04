@@ -822,7 +822,7 @@ function Start-DirectoryProcessing {
 }
 
 # Function: Get-TotalFileCount
-# Get the total number of files to be processed (for progress reporting) with improved path handling
+# Get the total number of files to be processed with improved path handling
 function Get-TotalFileCount {
     param (
         [string]$Path,
@@ -838,29 +838,40 @@ function Get-TotalFileCount {
     
     $count = 0
     
-    # Count files matching the inclusion criteria
-    $directories = @($normalizedPath)
-    $i = 0
+    # Create include patterns based on selective transfer options
+    $includePatterns = @()
+    if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots -or $TransferOptions) {
+        if ($TransferSaves) { $includePatterns += "*\Saves\*" }
+        if ($TransferMods) { $includePatterns += "*\Mods\*" }
+        if ($TransferTray) { $includePatterns += "*\Tray\*" }
+        if ($TransferScreenshots) { $includePatterns += "*\Screenshots\*" }
+        if ($TransferOptions) { $includePatterns += "*Options.ini*" }
+    }
     
-    # First, get all top-level directories to process
+    # Determine which directories to process
+    $directoriesToProcess = New-Object System.Collections.Queue
+    
     if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots) {
-        $directories = @()
+        # Only add selected directories
         if ($TransferSaves) { 
             $savesDir = Join-PathSafely -Path $normalizedPath -ChildPath "Saves"
-            if (Test-Path -Path $savesDir) { $directories += $savesDir }
+            if (Test-Path -Path $savesDir) { $directoriesToProcess.Enqueue($savesDir) }
         }
         if ($TransferMods) { 
             $modsDir = Join-PathSafely -Path $normalizedPath -ChildPath "Mods"
-            if (Test-Path -Path $modsDir) { $directories += $modsDir }
+            if (Test-Path -Path $modsDir) { $directoriesToProcess.Enqueue($modsDir) }
         }
         if ($TransferTray) { 
             $trayDir = Join-PathSafely -Path $normalizedPath -ChildPath "Tray"
-            if (Test-Path -Path $trayDir) { $directories += $trayDir }
+            if (Test-Path -Path $trayDir) { $directoriesToProcess.Enqueue($trayDir) }
         }
         if ($TransferScreenshots) { 
             $screenshotsDir = Join-PathSafely -Path $normalizedPath -ChildPath "Screenshots"
-            if (Test-Path -Path $screenshotsDir) { $directories += $screenshotsDir }
+            if (Test-Path -Path $screenshotsDir) { $directoriesToProcess.Enqueue($screenshotsDir) }
         }
+    } else {
+        # Process everything
+        $directoriesToProcess.Enqueue($normalizedPath)
     }
     
     # Add the Options.ini file separately if needed
@@ -871,46 +882,37 @@ function Get-TotalFileCount {
         }
     }
     
-    # Process each directory
-    while ($i -lt $directories.Count) {
-        $dir = $directories[$i]
-        $i++
+    # Process the directory queue
+    while ($directoriesToProcess.Count -gt 0) {
+        $currentDir = $directoriesToProcess.Dequeue()
         
-        if ([string]::IsNullOrEmpty($dir)) {
-            Write-Log "Empty directory path encountered in directory processing queue. Parent directory: $currentDir. Skipping iteration." -Level Warning
+        if ([string]::IsNullOrWhiteSpace($currentDir)) {
+            Write-Log "Empty directory path encountered in queue. Skipping." -Level Warning
             continue
         }
-        if (-not (Test-Path -Path $dir)) {
+        
+        if (-not (Test-Path -Path $currentDir -PathType Container)) {
+            Write-Log "Directory no longer exists: $currentDir. Skipping." -Level Warning
             continue
         }
         
         try {
             # Get all files in this directory (non-recursive)
-            $files = Get-ChildItem -Path $dir -File -ErrorAction Stop
+            $files = Get-ChildItem -Path $currentDir -File -ErrorAction Stop
             
             # Count files that aren't blacklisted
             foreach ($file in $files) {
                 if ($null -eq $file) { continue }
                 
                 if ([string]::IsNullOrWhiteSpace($file.FullName)) {
-                    Write-Log "file.FullName is empty, skipping file." -Level Warning
+                    Write-Log "File with empty path encountered in '$currentDir'. Skipping." -Level Warning
                     continue
                 }
                 
                 $relativePath = Get-RelativePath -BasePath $normalizedPath -FullPath $file.FullName
-                if ([string]::IsNullOrEmpty($relativePath)) {
-                    Write-Log "Computed relative path is empty for file $($file.FullName), skipping." -Level Warning
+                if ([string]::IsNullOrWhiteSpace($relativePath)) {
+                    Write-Log "Computed relative path is empty for file $($file.FullName). Skipping." -Level Warning
                     continue
-                }
-                
-                # Create include patterns based on selective transfer options
-                $includePatterns = @()
-                if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots -or $TransferOptions) {
-                    if ($TransferSaves) { $includePatterns += "*\Saves\*" }
-                    if ($TransferMods) { $includePatterns += "*\Mods\*" }
-                    if ($TransferTray) { $includePatterns += "*\Tray\*" }
-                    if ($TransferScreenshots) { $includePatterns += "*\Screenshots\*" }
-                    if ($TransferOptions) { $includePatterns += "*Options.ini*" }
                 }
                 
                 if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $BlacklistPatterns) {
@@ -918,18 +920,21 @@ function Get-TotalFileCount {
                 }
             }
             
-            # Add subdirectories to the directories array
-            $subdirs = Get-ChildItem -Path $dir -Directory -ErrorAction Stop
-            $directories += $subdirs.FullName
+            # Queue subdirectories for processing
+            $subdirs = Get-ChildItem -Path $currentDir -Directory -ErrorAction Stop
+            foreach ($subdir in $subdirs) {
+                if (-not [string]::IsNullOrWhiteSpace($subdir.FullName)) {
+                    $directoriesToProcess.Enqueue($subdir.FullName)
+                }
+            }
         }
         catch {
-            Write-Log "Error processing directory '$dir': $_. Skipping directory." -Level Error
+            Write-Log "Error processing directory '$currentDir': $_. Skipping directory." -Level Error
         }
     }
     
     return $count
 }
-
 # Function: Compare-DirectoryStructures
 # Compares source and destination directory structures with improved path handling
 function Compare-DirectoryStructures {
