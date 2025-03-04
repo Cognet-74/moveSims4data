@@ -524,6 +524,8 @@ function Invoke-SpecialFileHandler {
 # Processes a batch of files for transfer
 # Function: Start-FileBatchProcessing
 # Processes a batch of files for transfer
+# Function: Start-FileBatchProcessing
+# Processes a batch of files for transfer
 function Start-FileBatchProcessing {
     param (
         [System.IO.FileInfo[]]$FileBatch,
@@ -534,7 +536,7 @@ function Start-FileBatchProcessing {
         [bool]$UseForce
     )
     
-    $batchJobs = @()
+    $batchJobs = New-Object System.Collections.ArrayList
     
     foreach ($file in $FileBatch) {
         if ($null -eq $file) {
@@ -671,13 +673,18 @@ function Start-FileBatchProcessing {
                     }
                 } -ArgumentList $file.FullName, $destFile, $UseForce
                 
-                $batchJobs += @{Job = $job; RelativePath = $relativePath; DestFile = $destFile}
+                [void]$batchJobs.Add(@{
+                    Job = $job
+                    RelativePath = $relativePath
+                    DestFile = $destFile
+                })
             }
         }
     }
     
     return $batchJobs
 }
+
 # Function: Wait-ForCompletedJobs
 # Waits for jobs to complete and processes their results
 function Wait-ForCompletedJobs {
