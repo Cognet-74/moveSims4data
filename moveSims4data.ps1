@@ -522,6 +522,8 @@ function Invoke-SpecialFileHandler {
 
 # Function: Start-FileBatchProcessing
 # Processes a batch of files for transfer
+# Function: Start-FileBatchProcessing
+# Processes a batch of files for transfer
 function Start-FileBatchProcessing {
     param (
         [System.IO.FileInfo[]]$FileBatch,
@@ -550,8 +552,6 @@ function Start-FileBatchProcessing {
             continue
         }
         
-        $script:filesProcessed++
-        
         # Compute the file's relative path with improved error handling
         $relativePath = Get-RelativePath -BasePath $SourceRoot -FullPath $file.FullName
         
@@ -573,6 +573,9 @@ function Start-FileBatchProcessing {
             $script:filesSkipped++
             continue
         }
+        
+        # Only increment processed files counter AFTER all filtering is complete
+        $script:filesProcessed++
         
         # Build the full destination file path using the safe join function
         $destFile = Join-PathSafely -Path $DestinationRoot -ChildPath $relativePath
@@ -675,7 +678,6 @@ function Start-FileBatchProcessing {
     
     return $batchJobs
 }
-
 # Function: Wait-ForCompletedJobs
 # Waits for jobs to complete and processes their results
 function Wait-ForCompletedJobs {
