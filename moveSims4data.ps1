@@ -306,22 +306,28 @@ function Start-FileBatchProcessing {
         
         # Ensure the destination directory exists
         $destDir = Split-Path $destFile -Parent
-        if (-not (Test-Path -Path $destDir)) {
-            try {
-                if ($IsWhatIf) {
-                    Write-Log "Would create directory: $destDir"
-                }
-                else {
-                    New-Item -Path $destDir -ItemType Directory -Force | Out-Null
-                    Write-Log "Created directory: $destDir"
-                }
-            }
-            catch {
-                Write-Log "Error creating directory '$destDir': $_"
-                $script:filesWithErrors++
-                continue
-            }
+if ($null -eq $destDir) {
+    Write-Log "Warning: Destination directory is null for file $($file.FullName). Skipping file."
+    $script:filesSkipped++
+    continue
+}
+if (-not (Test-Path -Path $destDir)) {
+    try {
+        if ($IsWhatIf) {
+            Write-Log "Would create directory: $destDir"
         }
+        else {
+            New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+            Write-Log "Created directory: $destDir"
+        }
+    }
+    catch {
+        Write-Log "Error creating directory '$destDir': $_"
+        $script:filesWithErrors++
+        continue
+    }
+}
+
         
         # Decide if the file should be copied
         $copyFile = $true
