@@ -260,7 +260,12 @@ function Start-FileBatchProcessing {
         $script:filesProcessed++
         
         # Compute the file's relative path
-        $relativePath = $file.FullName.Substring($SourceRoot.Length)
+        if ($file.FullName.Length -ge $Path.Length) {
+            $relativePath = $file.FullName.Substring($Path.Length).TrimStart("\")
+        } else {
+            $relativePath = $file.FullName  # Fallback to full path if invalid index
+        }
+        
         
         # Skip this file if it matches any blacklist pattern
         if (Test-Blacklisted -RelativePath $relativePath -BlacklistPatterns $BlacklistPatterns) {
