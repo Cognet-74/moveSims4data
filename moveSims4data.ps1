@@ -242,6 +242,30 @@ function Invoke-SpecialFileHandler {
     }
 }
 
+# Function: Get-RelativePath
+# Gets the relative path between two paths
+function Get-RelativePath {
+    param (
+        [string]$Path,
+        [string]$BasePath
+    )
+    try {
+        return [System.IO.Path]::GetRelativePath($BasePath, $Path)
+    }
+    catch {
+        # Fallback method if GetRelativePath fails
+        if ($Path.StartsWith($BasePath, [StringComparison]::OrdinalIgnoreCase)) {
+            $relativePath = $Path.Substring($BasePath.Length)
+            if ($relativePath.StartsWith([IO.Path]::DirectorySeparatorChar) -or 
+                $relativePath.StartsWith([IO.Path]::AltDirectorySeparatorChar)) {
+                $relativePath = $relativePath.Substring(1)
+            }
+            return $relativePath
+        }
+        return $Path
+    }
+}
+
 # Function: Start-FileBatchProcessing
 # Processes a batch of files for transfer
 function Start-FileBatchProcessing {
@@ -260,7 +284,7 @@ function Start-FileBatchProcessing {
         $script:filesProcessed++
         
         # Compute the file's relative path
-        $relativePath = [System.IO.Path]::GetRelativePath($Path, $file.FullName)
+        $relativePath = Get-RelativePath -Path $file.FullName -BasePath $SourceRoot
 
         
         
@@ -452,7 +476,7 @@ function Get-TotalFileCount {
         
         # Count files that aren't blacklisted
         foreach ($file in $files) {
-            $relativePath = $file.FullName.Substring($Path.Length)
+            $relativePath = Get-RelativePath -Path $file.FullName -BasePath $Path
             if (-not (Test-Blacklisted -RelativePath $relativePath -BlacklistPatterns $BlacklistPatterns)) {
                 $count++
             }
@@ -660,7 +684,7 @@ if (-not $WhatIf) {
         $files = Get-ChildItem -Path $dir -File
         
         foreach ($file in $files) {
-            $relativePath = $file.FullName.Substring($SourcePath.Length)
+            $relativePath = Get-RelativePath -Path $file.FullName -BasePath $SourcePath
             if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
                 $sourceCount++
             }
@@ -682,7 +706,7 @@ if (-not $WhatIf) {
         $files = Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue
         
         foreach ($file in $files) {
-            $relativePath = $file.FullName.Substring($DestinationPath.Length)
+            $relativePath = Get-RelativePath -Path $file.FullName -BasePath $DestinationPath
             if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
                 $destCount++
             }
@@ -727,7 +751,7 @@ if ($VerifyStructure -and (-not $WhatIf)) {
         $files = Get-ChildItem -Path $dir -File
         
         foreach ($file in $files) {
-            $relativePath = $file.FullName.Substring($SourcePath.Length)
+            $relativePath = Get-RelativePath -Path $file.FullName -BasePath $SourcePath
             if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
                 $sourceRelativePaths += $relativePath
             }
@@ -743,13 +767,13 @@ if ($VerifyStructure -and (-not $WhatIf)) {
     $destRelativePaths = @()
     $destQueue = New-Object System.Collections.Queue
     $destQueue.Enqueue($DestinationPath)
-    
+
     while ($destQueue.Count -gt 0) {
         $dir = $destQueue.Dequeue()
         $files = Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue
         
         foreach ($file in $files) {
-            $relativePath = $file.FullName.Substring($DestinationPath.Length)
+            $relativePath = [System.IO.Path]::GetRelativePath($DestinationPath, $file.FullName)
             if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
                 $destRelativePaths += $relativePath
             }
@@ -760,23 +784,22 @@ if ($VerifyStructure -and (-not $WhatIf)) {
             $destQueue.Enqueue($subDir.FullName)
         }
     }
-    
-    # Compare paths and find differences
-    $structureDifferences = Compare-Object -ReferenceObject $sourceRelativePaths -DifferenceObject $destRelativePaths
-    if ($structureDifferences) {
-        Write-Log "Directory structure discrepancies found:"
-        foreach ($diff in $structureDifferences) {
-            $item = $diff.InputObject
-            $indicator = $diff.SideIndicator
-            
-            if ($indicator -eq "<=") {
-                Write-Log "Missing in destination: $item"
-            } else {
-                Write-Log "Extra in destination: $item"
-            }
-        }
+
+    # Compare source and destination paths
+    $missingFiles = $sourceRelativePaths | Where-Object { $_ -notin $destRelativePaths }
+    $extraFiles = $destRelativePaths | Where-Object { $_ -notin $sourceRelativePaths }
+
+    if ($missingFiles) {
+        Write-Log "Warning: The following files are missing from destination:"
+        $missingFiles | ForEach-Object { Write-Log "  $_" }
     }
-    else {
-        Write-Log "Directory structure and file locations match exactly."
+
+    if ($extraFiles) {
+        Write-Log "Warning: The following extra files were found in destination:"
+        $extraFiles | ForEach-Object { Write-Log "  $_" }
+    }
+
+    if (-not $missingFiles -and -not $extraFiles) {
+        Write-Log "Directory structure verification successful."
     }
 }
