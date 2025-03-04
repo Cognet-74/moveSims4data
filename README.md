@@ -2,7 +2,7 @@
 
 ## What is this? ✨
 
-This tool helps you safely move your precious Sims 4 data from one computer to another without causing chaos! It's perfect for when you:
+This tool helps you safely move your precious Sims 4 data from one windows computer to another without causing chaos! It's perfect for when you:
 
 - 💻 Got a shiny new computer
 - 🛠️ Need to reinstall your game
