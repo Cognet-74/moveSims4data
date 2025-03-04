@@ -877,7 +877,7 @@ function Get-TotalFileCount {
         $i++
         
         if ([string]::IsNullOrEmpty($dir)) {
-            Write-Log "'dir' is null or empty. Skipping iteration." -Level Warning
+            Write-Log "Empty directory path encountered in directory processing queue. Parent directory: $currentDir. Skipping iteration." -Level Warning
             continue
         }
         if (-not (Test-Path -Path $dir)) {
