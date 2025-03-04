@@ -1,4 +1,4 @@
-# 🏠 Sims 4 Data Transfer Tool 🏠
+# 🏠 Sims 4 Data Transfer Tool 🚚 💨🏠
 
 ## What is this? ✨
 
@@ -6,7 +6,7 @@ This tool helps you safely move your precious Sims 4 data from one computer to a
 
 - 💻 Got a shiny new computer
 - 🛠️ Need to reinstall your game
-- 🚨 Want to backup your Sims lives (just in case!)
+
 
 ## What it transfers 📦
 
@@ -58,6 +58,7 @@ Add `-WhatIf` to test the transfer without actually moving anything:
 ```
 .\moveSims4data.ps1 -SourcePath "E:\Documents\Electronic Arts\The Sims 4" -DestinationPath "C:\Users\YourUsername\Documents\Electronic Arts\The Sims 4" -Force -WhatIf
 ```
+❗make sure to replace YourUserName in the example above with your username on your computer❗
 
 ### Just want to transfer your mods and saves? 🎮
 
@@ -127,6 +128,6 @@ The script has additional options for performance tuning and custom file filteri
 
 ## Special Thanks ❤️
 
-A huge thank you to Clara for the inspiration behind this tool! After watching her struggle to transfer her heavily modded Sims 4 installation to a new computer (and seeing how heartbreaking it was when things went wrong), this tool was born to make the process smooth and painless for everyone.
+A huge thank you to my daughter Clara for the inspiration behind this tool! After watching her struggle to transfer her heavily modded Sims 4 installation to a new computer (and seeing how heartbreaking it was when things went wrong), this tool was born to make the process smooth and painless for everyone.
 
 Happy Simming! 🎮✨
