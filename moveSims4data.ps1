@@ -17,6 +17,7 @@
       - Supporting selective transfers of specific data types (saves, mods, etc.).
       - Providing progress reporting during the file transfer process.
       - Offering parallel processing for improved performance.
+      - Processing files as a stream to minimize memory usage.
 
 .PARAMETERS
     -SourcePath
@@ -48,6 +49,8 @@
         (Switch) Transfer Options.ini file.
     -MaxParallelJobs
         (Optional) Maximum number of parallel file copy operations. Default is 4.
+    -BatchSize
+        (Optional) Number of files to process in each batch. Default is 100.
 
 .EXAMPLE
     # Dry-run (simulate) the transfer, using the default blacklist:
@@ -97,7 +100,9 @@ param(
     
     [switch]$TransferOptions,
     
-    [int]$MaxParallelJobs = 4
+    [int]$MaxParallelJobs = 4,
+    
+    [int]$BatchSize = 100
 )
 
 # Set default blacklist if user does not provide one.
@@ -117,6 +122,7 @@ $filesProcessed = 0
 $filesSkipped = 0
 $filesCopied = 0
 $filesWithErrors = 0
+$totalFiles = 0
 
 # Function: Write-Log
 # Writes a message to the console and appends it to a log file if provided.
@@ -152,6 +158,28 @@ function Test-Blacklisted {
             return $true
         }
     }
+    return $false
+}
+
+# Function: Test-ShouldInclude
+# Determines if a file should be included in the transfer based on selective transfer options.
+function Test-ShouldInclude {
+    param (
+        [string]$RelativePath
+    )
+    
+    # If no selective transfer options are specified, include all files
+    if (-not ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots -or $TransferOptions)) {
+        return $true
+    }
+    
+    # Check if the file matches any of the selective transfer criteria
+    if ($TransferSaves -and $RelativePath -like "*\Saves\*") { return $true }
+    if ($TransferMods -and $RelativePath -like "*\Mods\*") { return $true }
+    if ($TransferTray -and $RelativePath -like "*\Tray\*") { return $true }
+    if ($TransferScreenshots -and $RelativePath -like "*\Screenshots\*") { return $true }
+    if ($TransferOptions -and $RelativePath -like "*Options.ini*") { return $true }
+    
     return $false
 }
 
@@ -214,6 +242,228 @@ function Invoke-SpecialFileHandler {
     }
 }
 
+# Function: Start-FileBatchProcessing
+# Processes a batch of files for transfer
+function Start-FileBatchProcessing {
+    param (
+        [System.IO.FileInfo[]]$FileBatch,
+        [string]$SourceRoot,
+        [string]$DestinationRoot,
+        [string[]]$BlacklistPatterns,
+        [bool]$IsWhatIf,
+        [bool]$UseForce
+    )
+    
+    $batchJobs = @()
+    
+    foreach ($file in $FileBatch) {
+        $script:filesProcessed++
+        
+        # Compute the file's relative path
+        $relativePath = $file.FullName.Substring($SourceRoot.Length)
+        
+        # Skip this file if it matches any blacklist pattern
+        if (Test-Blacklisted -RelativePath $relativePath -BlacklistPatterns $BlacklistPatterns) {
+            Write-Log "Skipping blacklisted file: $relativePath"
+            $script:filesSkipped++
+            continue
+        }
+        
+        # Skip this file if it doesn't match inclusion criteria
+        if (-not (Test-ShouldInclude -RelativePath $relativePath)) {
+            $script:filesSkipped++
+            continue
+        }
+        
+        # Build the full destination file path
+        $destFile = Join-Path $DestinationRoot $relativePath
+        
+        # Ensure the destination directory exists
+        $destDir = Split-Path $destFile -Parent
+        if (-not (Test-Path -Path $destDir)) {
+            try {
+                if ($IsWhatIf) {
+                    Write-Log "Would create directory: $destDir"
+                }
+                else {
+                    New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+                    Write-Log "Created directory: $destDir"
+                }
+            }
+            catch {
+                Write-Log "Error creating directory '$destDir': $_"
+                $script:filesWithErrors++
+                continue
+            }
+        }
+        
+        # Decide if the file should be copied
+        $copyFile = $true
+        
+        # If the file exists in the destination, compare metadata and file hash
+        if (Test-Path -Path $destFile) {
+            $destInfo = Get-Item -Path $destFile
+            # First, compare file size and last write time
+            if (($file.Length -eq $destInfo.Length) -and ($file.LastWriteTime -eq $destInfo.LastWriteTime)) {
+                # If metadata matches, compute hashes to confirm file content
+                $srcHash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash
+                $destHash = (Get-FileHash -Path $destFile -Algorithm SHA256).Hash
+                if ($srcHash -eq $destHash) {
+                    Write-Log "Skipping identical file: $relativePath (metadata and hash match)"
+                    $script:filesSkipped++
+                    $copyFile = $false
+                }
+                else {
+                    Write-Log "File $relativePath has matching metadata but different hash. Will copy file."
+                }
+            }
+            else {
+                # If metadata differs, still do a hash check
+                $srcHash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash
+                $destHash = (Get-FileHash -Path $destFile -Algorithm SHA256).Hash
+                if ($srcHash -eq $destHash) {
+                    Write-Log "Skipping file: $relativePath (hashes match despite metadata differences)"
+                    $script:filesSkipped++
+                    $copyFile = $false
+                }
+                else {
+                    Write-Log "File $relativePath differs (metadata or hash mismatch). Will copy file."
+                }
+            }
+        }
+        else {
+            Write-Log "File $relativePath does not exist in destination. Will copy file."
+        }
+        
+        # If file needs to be copied, perform the copy operation
+        if ($copyFile) {
+            if ($IsWhatIf) {
+                Write-Log "Would copy file: $relativePath (WhatIf mode)"
+                $script:filesCopied++
+            } else {
+                # Start a background job for this file
+                $job = Start-Job -ScriptBlock {
+                    param($src, $dest, $force)
+                    try {
+                        if ($force) {
+                            Copy-Item -Path $src -Destination $dest -Force
+                        } else {
+                            Copy-Item -Path $src -Destination $dest
+                        }
+                        return @{Success = $true; Path = $dest}
+                    } catch {
+                        return @{Success = $false; Path = $dest; Error = $_.Exception.Message}
+                    }
+                } -ArgumentList $file.FullName, $destFile, $UseForce
+                
+                $batchJobs += @{Job = $job; RelativePath = $relativePath; DestFile = $destFile}
+            }
+        }
+    }
+    
+    return $batchJobs
+}
+
+# Function: Wait-ForCompletedJobs
+# Waits for jobs to complete and processes their results
+function Wait-ForCompletedJobs {
+    param (
+        [array]$Jobs,
+        [bool]$WaitForAll = $false
+    )
+    
+    $completedJobs = @()
+    
+    foreach ($jobInfo in $Jobs) {
+        if ($jobInfo.Job.State -ne "Running" -or $WaitForAll) {
+            if ($WaitForAll -and $jobInfo.Job.State -eq "Running") {
+                $jobInfo.Job | Wait-Job | Out-Null
+            }
+            
+            $result = Receive-Job -Job $jobInfo.Job
+            if ($result.Success) {
+                Write-Log "Copied file: $($jobInfo.RelativePath)"
+                Invoke-SpecialFileHandler -FilePath $jobInfo.DestFile
+                $script:filesCopied++
+            } else {
+                Write-Log "Error copying file '$($jobInfo.RelativePath)': $($result.Error)"
+                $script:filesWithErrors++
+            }
+            Remove-Job -Job $jobInfo.Job
+            $completedJobs += $jobInfo
+        }
+    }
+    
+    # Remove completed jobs from the tracking array
+    $remainingJobs = @()
+    foreach ($job in $Jobs) {
+        if (-not $completedJobs.Contains($job)) {
+            $remainingJobs += $job
+        }
+    }
+    
+    return $remainingJobs
+}
+
+# Function: Get-TotalFileCount
+# Get the total number of files to be processed (for progress reporting)
+function Get-TotalFileCount {
+    param (
+        [string]$Path,
+        [string[]]$BlacklistPatterns
+    )
+    
+    $count = 0
+    
+    # Count files matching the inclusion criteria
+    $directories = @($Path)
+    $i = 0
+    
+    # First, get all top-level directories to process
+    if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots) {
+        $directories = @()
+        if ($TransferSaves) { $directories += Join-Path $Path "Saves" }
+        if ($TransferMods) { $directories += Join-Path $Path "Mods" }
+        if ($TransferTray) { $directories += Join-Path $Path "Tray" }
+        if ($TransferScreenshots) { $directories += Join-Path $Path "Screenshots" }
+    }
+    
+    # Add the Options.ini file separately if needed
+    if ($TransferOptions) {
+        $optionsFile = Join-Path $Path "Options.ini"
+        if (Test-Path $optionsFile) {
+            $count++
+        }
+    }
+    
+    # Process each directory
+    while ($i -lt $directories.Count) {
+        $dir = $directories[$i]
+        $i++
+        
+        if (-not (Test-Path $dir)) {
+            continue
+        }
+        
+        # Get all files in this directory (non-recursive)
+        $files = Get-ChildItem -Path $dir -File
+        
+        # Count files that aren't blacklisted
+        foreach ($file in $files) {
+            $relativePath = $file.FullName.Substring($Path.Length)
+            if (-not (Test-Blacklisted -RelativePath $relativePath -BlacklistPatterns $BlacklistPatterns)) {
+                $count++
+            }
+        }
+        
+        # Add subdirectories to the directories array
+        $subdirs = Get-ChildItem -Path $dir -Directory
+        $directories += $subdirs.FullName
+    }
+    
+    return $count
+}
+
 # Begin Script Execution
 Write-Log "Starting Sims 4 data transfer..."
 Write-Log "Source: $SourcePath"
@@ -248,270 +498,283 @@ if (-not (Test-Path -Path $DestinationPath)) {
     Write-Log "Backup location: $backupLocation"
 }
 
-Write-Log "Processing files from '$SourcePath'..."
-
-# Get a list of all files in the source directory recursively.
-$sourceFiles = Get-ChildItem -Path $SourcePath -Recurse -File
-
-# Filter files based on selective transfer options if any are specified
+# Log which data types will be transferred
 if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots -or $TransferOptions) {
-    Write-Log "Applying selective transfer filters..."
-    $inclusionPaths = @()
-    
-    if ($TransferSaves) { 
-        $inclusionPaths += "*\Saves\*" 
-        Write-Log "Including: Saves"
-    }
-    if ($TransferMods) { 
-        $inclusionPaths += "*\Mods\*" 
-        Write-Log "Including: Mods"
-    }
-    if ($TransferTray) { 
-        $inclusionPaths += "*\Tray\*" 
-        Write-Log "Including: Tray"
-    }
-    if ($TransferScreenshots) { 
-        $inclusionPaths += "*\Screenshots\*" 
-        Write-Log "Including: Screenshots"
-    }
-    if ($TransferOptions) { 
-        $inclusionPaths += "*Options.ini*" 
-        Write-Log "Including: Options.ini"
-    }
-    
-    # Filter source files by inclusion paths
-    $filteredFiles = @()
-    foreach ($srcFile in $sourceFiles) {
-        $relativePath = $srcFile.FullName.Substring($SourcePath.Length)
-        foreach ($pattern in $inclusionPaths) {
-            if ($relativePath -like $pattern) {
-                $filteredFiles += $srcFile
-                break
-            }
-        }
-    }
-    $sourceFiles = $filteredFiles
-    Write-Log "Selected $($sourceFiles.Count) files for transfer based on filters."
+    Write-Log "Selective transfer enabled. Including:"
+    if ($TransferSaves) { Write-Log " - Saves" }
+    if ($TransferMods) { Write-Log " - Mods" }
+    if ($TransferTray) { Write-Log " - Tray" }
+    if ($TransferScreenshots) { Write-Log " - Screenshots" }
+    if ($TransferOptions) { Write-Log " - Options.ini" }
 }
 
-$totalFiles = $sourceFiles.Count
-Write-Log "Found $totalFiles files to process."
+# Get an estimate of total files for progress reporting
+# (This is more efficient than a full recursive scan)
+$totalFiles = Get-TotalFileCount -Path $SourcePath -BlacklistPatterns $Blacklist
+Write-Log "Estimated total files to process: $totalFiles"
 
-# Initialize parallel job array
-$jobs = @()
-$currentFile = 0
+# Create an array to track all active jobs
+$activeJobs = @()
 
-foreach ($srcFile in $sourceFiles) {
-    $currentFile++
-    $filesProcessed++
-    
-    # Show progress
-    $percentComplete = [int](($currentFile / $totalFiles) * 100)
-    Write-Progress -Activity "Transferring Sims 4 Files" -Status "Processing $currentFile of $totalFiles" -PercentComplete $percentComplete
-    
-    # Compute the file's relative path (so we can match against blacklist and build destination path).
-    $relativePath = $srcFile.FullName.Substring($SourcePath.Length)
-    # Build the full destination file path.
-    $destFile = Join-Path $DestinationPath $relativePath
+# Process the Options.ini file separately if required
+if ($TransferOptions) {
+    $optionsFile = Join-Path $SourcePath "Options.ini"
+    if (Test-Path $optionsFile) {
+        $optionsFileInfo = Get-Item $optionsFile
+        $optionsBatch = @($optionsFileInfo)
+        $optionsJobs = Start-FileBatchProcessing -FileBatch $optionsBatch -SourceRoot $SourcePath -DestinationRoot $DestinationPath -BlacklistPatterns $Blacklist -IsWhatIf $WhatIf -UseForce $Force
+        $activeJobs += $optionsJobs
+    }
+}
 
-    # Skip this file if it matches any blacklist pattern.
-    if (Test-Blacklisted -RelativePath $relativePath -BlacklistPatterns $Blacklist) {
-        Write-Log "Skipping blacklisted file: $relativePath"
-        $filesSkipped++
+# Define directories to process based on selected options
+$directories = @()
+if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots) {
+    if ($TransferSaves) { $directories += Join-Path $SourcePath "Saves" }
+    if ($TransferMods) { $directories += Join-Path $SourcePath "Mods" }
+    if ($TransferTray) { $directories += Join-Path $SourcePath "Tray" }
+    if ($TransferScreenshots) { $directories += Join-Path $SourcePath "Screenshots" }
+} else {
+    # If no specific options selected, process the whole directory
+    $directories += $SourcePath
+}
+
+# Process each main directory using a streaming approach
+foreach ($directory in $directories) {
+    if (-not (Test-Path $directory)) {
+        Write-Log "Directory not found, skipping: $directory"
         continue
     }
     
-    # Ensure the destination directory exists.
-    $destDir = Split-Path $destFile -Parent
-    if (-not (Test-Path -Path $destDir)) {
-        try {
-            if ($WhatIf) {
-                Write-Log "Would create directory: $destDir"
-            }
-            else {
-                New-Item -Path $destDir -ItemType Directory -Force | Out-Null
-                Write-Log "Created directory: $destDir"
-            }
-        }
-        catch {
-            Write-Log "Error creating directory '$destDir': $_"
-            $filesWithErrors++
-            continue
-        }
-    }
+    Write-Log "Processing directory: $directory"
     
-    # Decide if the file should be copied.
-    $copyFile = $true
-
-    # If the file exists in the destination, compare metadata and file hash.
-    if (Test-Path -Path $destFile) {
-        $destInfo = Get-Item -Path $destFile
-        # First, compare file size and last write time.
-        if (($srcFile.Length -eq $destInfo.Length) -and ($srcFile.LastWriteTime -eq $destInfo.LastWriteTime)) {
-            # If metadata matches, compute hashes to confirm file content.
-            $srcHash = (Get-FileHash -Path $srcFile.FullName -Algorithm SHA256).Hash
-            $destHash = (Get-FileHash -Path $destFile -Algorithm SHA256).Hash
-            if ($srcHash -eq $destHash) {
-                Write-Log "Skipping identical file: $relativePath (metadata and hash match)"
-                $filesSkipped++
-                $copyFile = $false
-            }
-            else {
-                Write-Log "File $relativePath has matching metadata but different hash. Will copy file."
+    # Use a queue to process directories without recursion
+    $dirQueue = New-Object System.Collections.Queue
+    $dirQueue.Enqueue($directory)
+    
+    while ($dirQueue.Count -gt 0) {
+        $currentDir = $dirQueue.Dequeue()
+        
+        # Get files in current directory (non-recursive)
+        $currentBatch = @()
+        $files = Get-ChildItem -Path $currentDir -File
+        
+        # Add files to the current batch
+        $currentBatch += $files
+        
+        # Process the batch if it's full or if we've exhausted files in this directory
+        if ($currentBatch.Count -ge $BatchSize) {
+            # Process this batch of files
+            $newJobs = Start-FileBatchProcessing -FileBatch $currentBatch -SourceRoot $SourcePath -DestinationRoot $DestinationPath -BlacklistPatterns $Blacklist -IsWhatIf $WhatIf -UseForce $Force
+            $activeJobs += $newJobs
+            $currentBatch = @()
+            
+            # Update progress
+            $percentComplete = [int](($filesProcessed / $totalFiles) * 100)
+            Write-Progress -Activity "Transferring Sims 4 Files" -Status "Processing $filesProcessed of $totalFiles" -PercentComplete $percentComplete
+            
+            # Wait for jobs to complete if we've reached the max
+            while ($activeJobs.Count -ge $MaxParallelJobs) {
+                Start-Sleep -Milliseconds 100
+                $activeJobs = Wait-ForCompletedJobs -Jobs $activeJobs
             }
         }
-        else {
-            # If metadata differs, still do a hash check.
-            $srcHash = (Get-FileHash -Path $srcFile.FullName -Algorithm SHA256).Hash
-            $destHash = (Get-FileHash -Path $destFile -Algorithm SHA256).Hash
-            if ($srcHash -eq $destHash) {
-                Write-Log "Skipping file: $relativePath (hashes match despite metadata differences)"
-                $filesSkipped++
-                $copyFile = $false
-            }
-            else {
-                Write-Log "File $relativePath differs (metadata or hash mismatch). Will copy file."
-            }
+        
+        # Queue subdirectories for processing
+        $subDirs = Get-ChildItem -Path $currentDir -Directory
+        foreach ($subDir in $subDirs) {
+            $dirQueue.Enqueue($subDir.FullName)
         }
-    }
-    else {
-        Write-Log "File $relativePath does not exist in destination. Will copy file."
-    }
-
-    # If file needs to be copied, perform the copy operation.
-    if ($copyFile) {
-        if ($WhatIf) {
-            Write-Log "Would copy file: $relativePath (WhatIf mode)"
-            $filesCopied++
-        } else {
-            # Use parallel jobs for file copying if not in WhatIf mode
-            $job = Start-Job -ScriptBlock {
-                param($src, $dest, $force)
-                try {
-                    if ($force) {
-                        Copy-Item -Path $src -Destination $dest -Force
-                    } else {
-                        Copy-Item -Path $src -Destination $dest
-                    }
-                    return @{Success = $true; Path = $dest}
-                } catch {
-                    return @{Success = $false; Path = $dest; Error = $_.Exception.Message}
-                }
-            } -ArgumentList $srcFile.FullName, $destFile, $Force
+        
+        # Process any remaining files in the batch
+        if ($currentBatch.Count -gt 0) {
+            $newJobs = Start-FileBatchProcessing -FileBatch $currentBatch -SourceRoot $SourcePath -DestinationRoot $DestinationPath -BlacklistPatterns $Blacklist -IsWhatIf $WhatIf -UseForce $Force
+            $activeJobs += $newJobs
             
-            $jobs += @{Job = $job; RelativePath = $relativePath; DestFile = $destFile}
-            
-            # Wait if we've reached the max parallel jobs
-            while ($jobs.Count -ge $MaxParallelJobs) {
-                $completedJobs = @()
-                foreach ($jobInfo in $jobs) {
-                    if ($jobInfo.Job.State -ne "Running") {
-                        $result = Receive-Job -Job $jobInfo.Job
-                        if ($result.Success) {
-                            Write-Log "Copied file: $($jobInfo.RelativePath)"
-                            Invoke-SpecialFileHandler -FilePath $jobInfo.DestFile
-                            $filesCopied++
-                        } else {
-                            Write-Log "Error copying file '$($jobInfo.RelativePath)': $($result.Error)"
-                            $filesWithErrors++
-                        }
-                        Remove-Job -Job $jobInfo.Job
-                        $completedJobs += $jobInfo
-                    }
-                }
-                
-                # Remove completed jobs from the tracking array
-                foreach ($completed in $completedJobs) {
-                    $jobs = $jobs | Where-Object { $_ -ne $completed }
-                }
-                
-                if ($jobs.Count -ge $MaxParallelJobs) {
-                    Start-Sleep -Milliseconds 100
-                }
-            }
+            # Update progress
+            $percentComplete = [int](($filesProcessed / $totalFiles) * 100)
+            Write-Progress -Activity "Transferring Sims 4 Files" -Status "Processing $filesProcessed of $totalFiles" -PercentComplete $percentComplete
         }
     }
 }
 
-# Wait for remaining jobs to complete
+# Wait for all remaining jobs to complete
 Write-Log "Waiting for remaining file copy operations to complete..."
-while ($jobs.Count -gt 0) {
-    $completedJobs = @()
-    foreach ($jobInfo in $jobs) {
-        if ($jobInfo.Job.State -ne "Running") {
-            $result = Receive-Job -Job $jobInfo.Job
-            if ($result.Success) {
-                Write-Log "Copied file: $($jobInfo.RelativePath)"
-                Invoke-SpecialFileHandler -FilePath $jobInfo.DestFile
-                $filesCopied++
-            } else {
-                Write-Log "Error copying file '$($jobInfo.RelativePath)': $($result.Error)"
-                $filesWithErrors++
-            }
-            Remove-Job -Job $jobInfo.Job
-            $completedJobs += $jobInfo
-        }
-    }
-    
-    # Remove completed jobs from the tracking array
-    foreach ($completed in $completedJobs) {
-        $jobs = $jobs | Where-Object { $_ -ne $completed }
-    }
-    
-    if ($jobs.Count -gt 0) {
-        Start-Sleep -Milliseconds 100
-    }
-}
+Wait-ForCompletedJobs -Jobs $activeJobs -WaitForAll $true
 
 # Ensure progress bar is completed
 Write-Progress -Activity "Transferring Sims 4 Files" -Status "Complete" -PercentComplete 100 -Completed
 
-# Post-Copy: Verify by comparing file counts.
+# Post-Copy: Verify by comparing file counts if not in WhatIf mode
 if (-not $WhatIf) {
-    $finalSourceCount = (Get-ChildItem -Path $SourcePath -Recurse -File | 
-        Where-Object { -not (Test-Blacklisted -RelativePath $_.FullName.Substring($SourcePath.Length) -BlacklistPatterns $Blacklist) }).Count
+    Write-Log "Performing post-copy verification..."
+    
+    # Build include patterns based on selective transfer options
+    $includePatterns = @()
+    if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots -or $TransferOptions) {
+        if ($TransferSaves) { $includePatterns += "*\Saves\*" }
+        if ($TransferMods) { $includePatterns += "*\Mods\*" }
+        if ($TransferTray) { $includePatterns += "*\Tray\*" }
+        if ($TransferScreenshots) { $includePatterns += "*\Screenshots\*" }
+        if ($TransferOptions) { $includePatterns += "*Options.ini*" }
+    }
+    
+    # Function to check if a file should be counted in verification
+    function Test-ShouldCount {
+        param (
+            [string]$Path,
+            [string[]]$IncludePatterns,
+            [string[]]$ExcludePatterns
+        )
         
-    $finalDestCount = (Get-ChildItem -Path $DestinationPath -Recurse -File).Count
+        # If the file is blacklisted, don't count it
+        if ((Test-Blacklisted -RelativePath $Path -BlacklistPatterns $ExcludePatterns)) {
+            return $false
+        }
+        
+        # If we have include patterns and the file doesn't match any, don't count it
+        if ($IncludePatterns.Count -gt 0) {
+            $shouldInclude = $false
+            foreach ($pattern in $IncludePatterns) {
+                if ($Path -like $pattern) {
+                    $shouldInclude = $true
+                    break
+                }
+            }
+            return $shouldInclude
+        }
+        
+        # Default case: count the file
+        return $true
+    }
     
-    Write-Log "Post-Copy Verification: Source file count = $finalSourceCount, Destination file count = $finalDestCount."
+    # Count source files
+    $sourceCount = 0
+    $sourceQueue = New-Object System.Collections.Queue
+    $sourceQueue.Enqueue($SourcePath)
     
-    if ($finalSourceCount -ne $finalDestCount) {
+    while ($sourceQueue.Count -gt 0) {
+        $dir = $sourceQueue.Dequeue()
+        $files = Get-ChildItem -Path $dir -File
+        
+        foreach ($file in $files) {
+            $relativePath = $file.FullName.Substring($SourcePath.Length)
+            if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
+                $sourceCount++
+            }
+        }
+        
+        $subDirs = Get-ChildItem -Path $dir -Directory
+        foreach ($subDir in $subDirs) {
+            $sourceQueue.Enqueue($subDir.FullName)
+        }
+    }
+    
+    # Count destination files
+    $destCount = 0
+    $destQueue = New-Object System.Collections.Queue
+    $destQueue.Enqueue($DestinationPath)
+    
+    while ($destQueue.Count -gt 0) {
+        $dir = $destQueue.Dequeue()
+        $files = Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue
+        
+        foreach ($file in $files) {
+            $relativePath = $file.FullName.Substring($DestinationPath.Length)
+            if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
+                $destCount++
+            }
+        }
+        
+        $subDirs = Get-ChildItem -Path $dir -Directory -ErrorAction SilentlyContinue
+        foreach ($subDir in $subDirs) {
+            $destQueue.Enqueue($subDir.FullName)
+        }
+    }
+    
+    Write-Log "Post-Copy Verification: Source file count = $sourceCount, Destination file count = $destCount."
+    
+    if ($sourceCount -ne $destCount) {
         Write-Log "Warning: File count mismatch between source and destination."
     } else {
         Write-Log "File count verification successful."
     }
 }
 
-# Optional: Verify the overall directory structure if requested.
+# Optional: Verify the overall directory structure if requested
 if ($VerifyStructure -and (-not $WhatIf)) {
     Write-Log "Verifying overall directory structure and file locations..."
     
-    # Get lists of relative file paths for both source and destination.
-    $sourceRelativeFiles = Get-ChildItem -Path $SourcePath -Recurse -File | 
-        Where-Object { -not (Test-Blacklisted -RelativePath $_.FullName.Substring($SourcePath.Length) -BlacklistPatterns $Blacklist) } | 
-        ForEach-Object { $_.FullName.Substring($SourcePath.Length) }
-        
-    $destRelativeFiles = Get-ChildItem -Path $DestinationPath -Recurse -File | ForEach-Object {
-        $_.FullName.Substring($DestinationPath.Length)
+    # Build include patterns based on selective transfer options
+    $includePatterns = @()
+    if ($TransferSaves -or $TransferMods -or $TransferTray -or $TransferScreenshots -or $TransferOptions) {
+        if ($TransferSaves) { $includePatterns += "*\Saves\*" }
+        if ($TransferMods) { $includePatterns += "*\Mods\*" }
+        if ($TransferTray) { $includePatterns += "*\Tray\*" }
+        if ($TransferScreenshots) { $includePatterns += "*\Screenshots\*" }
+        if ($TransferOptions) { $includePatterns += "*Options.ini*" }
     }
     
-    $structureDifferences = Compare-Object -ReferenceObject $sourceRelativeFiles -DifferenceObject $destRelativeFiles
+    # Get source relative paths
+    $sourceRelativePaths = @()
+    $sourceQueue = New-Object System.Collections.Queue
+    $sourceQueue.Enqueue($SourcePath)
+    
+    while ($sourceQueue.Count -gt 0) {
+        $dir = $sourceQueue.Dequeue()
+        $files = Get-ChildItem -Path $dir -File
+        
+        foreach ($file in $files) {
+            $relativePath = $file.FullName.Substring($SourcePath.Length)
+            if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
+                $sourceRelativePaths += $relativePath
+            }
+        }
+        
+        $subDirs = Get-ChildItem -Path $dir -Directory
+        foreach ($subDir in $subDirs) {
+            $sourceQueue.Enqueue($subDir.FullName)
+        }
+    }
+    
+    # Get destination relative paths
+    $destRelativePaths = @()
+    $destQueue = New-Object System.Collections.Queue
+    $destQueue.Enqueue($DestinationPath)
+    
+    while ($destQueue.Count -gt 0) {
+        $dir = $destQueue.Dequeue()
+        $files = Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue
+        
+        foreach ($file in $files) {
+            $relativePath = $file.FullName.Substring($DestinationPath.Length)
+            if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
+                $destRelativePaths += $relativePath
+            }
+        }
+        
+        $subDirs = Get-ChildItem -Path $dir -Directory -ErrorAction SilentlyContinue
+        foreach ($subDir in $subDirs) {
+            $destQueue.Enqueue($subDir.FullName)
+        }
+    }
+    
+    # Compare paths and find differences
+    $structureDifferences = Compare-Object -ReferenceObject $sourceRelativePaths -DifferenceObject $destRelativePaths
     if ($structureDifferences) {
         Write-Log "Directory structure discrepancies found:"
-        $structureDifferences | ForEach-Object { Write-Log $_ }
+        foreach ($diff in $structureDifferences) {
+            $item = $diff.InputObject
+            $indicator = $diff.SideIndicator
+            
+            if ($indicator -eq "<=") {
+                Write-Log "Missing in destination: $item"
+            } else {
+                Write-Log "Extra in destination: $item"
+            }
+        }
     }
     else {
         Write-Log "Directory structure and file locations match exactly."
     }
 }
-
-# Generate summary report
-Write-Log "----------------------------------------------"
-Write-Log "Transfer Summary:"
-Write-Log "  Files processed: $filesProcessed"
-Write-Log "  Files skipped (identical): $filesSkipped"
-Write-Log "  Files copied: $filesCopied"
-Write-Log "  Files with errors: $filesWithErrors"
-Write-Log "----------------------------------------------"
-
-Write-Log "Sims 4 data transfer complete. You may now launch Sims 4 on your new installation."
