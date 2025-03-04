@@ -246,25 +246,26 @@ function Invoke-SpecialFileHandler {
 # Gets the relative path between two paths
 function Get-RelativePath {
     param (
-        [string]$Path,
-        [string]$BasePath
+        [string]$BasePath,
+        [string]$FullPath
     )
-    try {
-        return [System.IO.Path]::GetRelativePath($BasePath, $Path)
+    # Resolve the full paths
+    $basePath = (Resolve-Path $BasePath).Path
+    $fullPath = (Resolve-Path $FullPath).Path
+
+    # Ensure the base path ends with a directory separator
+    if (-not $basePath.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+        $basePath += [System.IO.Path]::DirectorySeparatorChar
     }
-    catch {
-        # Fallback method if GetRelativePath fails
-        if ($Path.StartsWith($BasePath, [StringComparison]::OrdinalIgnoreCase)) {
-            $relativePath = $Path.Substring($BasePath.Length)
-            if ($relativePath.StartsWith([IO.Path]::DirectorySeparatorChar) -or 
-                $relativePath.StartsWith([IO.Path]::AltDirectorySeparatorChar)) {
-                $relativePath = $relativePath.Substring(1)
-            }
-            return $relativePath
-        }
-        return $Path
-    }
+
+    $baseUri = New-Object System.Uri($basePath)
+    $fullUri = New-Object System.Uri($fullPath)
+    $relativeUri = $baseUri.MakeRelativeUri($fullUri)
+    $relativePath = [System.Uri]::UnescapeDataString($relativeUri.ToString())
+    # Convert URI separators to Windows path separators
+    return $relativePath -replace '/', '\'
 }
+
 
 # Function: Start-FileBatchProcessing
 # Processes a batch of files for transfer
@@ -783,7 +784,7 @@ if ($VerifyStructure -and (-not $WhatIf)) {
         $files = Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue
         
         foreach ($file in $files) {
-            $relativePath = [System.IO.Path]::GetRelativePath($DestinationPath, $file.FullName)
+            $relativePath = Get-RelativePath -BasePath $DestinationPath -FullPath $file.FullName
             if (Test-ShouldCount -Path $relativePath -IncludePatterns $includePatterns -ExcludePatterns $Blacklist) {
                 $destRelativePaths += $relativePath
             }
